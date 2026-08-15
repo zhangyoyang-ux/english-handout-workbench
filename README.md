@@ -1,26 +1,38 @@
 # 个人英语讲义工作台
 
-第一阶段的干净项目，只验证“文字输入 → 自动保存 → 刷新/换设备继续读取”的核心链路。
+第一阶段生产架构：
+
+`GitHub Pages → React → Supabase Edge Function → Supabase PostgreSQL`
+
+当前只验证文字输入、自动保存、云端持久化与跨设备读取。不包含登录、图片、正式章节、知识点、搜索、备份或 Cron。
 
 ## 技术架构
 
 - 前端：Vite + React + TypeScript
-- 部署：Vercel
-- API：Vercel Server Function，`/api/notes`
+- 网页托管：GitHub Pages
+- 服务端 API：Supabase Edge Function，`notes`
 - 数据库：Supabase PostgreSQL
-- Schema：Supabase SQL migration
+- 数据 Schema：`supabase/migrations/0001_stage1_notes.sql`
+- Edge Function 源码：`supabase/functions/notes/index.ts`
 
 ## 本地运行
 
-1. 复制 `.env.example` 为 `.env`。
-2. 填入新的 Supabase 项目 URL 与仅服务端使用的 `SUPABASE_SERVICE_ROLE_KEY`。
-3. 在新的 Supabase 项目执行 `supabase/migrations/0001_stage1_notes.sql`。
-4. 运行 `npm install`、`npm run dev` 可以预览前端页面。
+```text
+npm install
+npm run dev
+```
 
-`npm run dev` 是 Vite 前端预览，不会在本地自动托管 Vercel 的 `/api/notes` Server Function；本地要联调真实 API，需要使用已连接 Vercel 项目的本地运行方式。正式验收以 Vercel Production 为准。
+前端通过 `VITE_NOTES_FUNCTION_URL` 访问 Edge Function；该变量只包含公开 Endpoint，不包含任何 Secret。
 
-浏览器只访问 `/api/notes`，不会持有高权限数据库 Secret。LocalStorage 只保存尚未成功上传的临时草稿；云端内容优先。
+## Supabase
 
-## 第一阶段边界
+1. 在新的 Supabase Project 执行 `supabase/migrations/0001_stage1_notes.sql`。
+2. 部署 `supabase/functions/notes/index.ts`，函数名为 `notes`。
+3. 保持 Edge Function 服务端使用 `SUPABASE_SERVICE_ROLE_KEY`，不要把它写入 React、`VITE_*` 变量或 Git。
+4. 生产前端来源允许 `https://zhangyoyang-ux.github.io`，本地开发来源仅用于调试。
 
-当前没有登录、用户体系、图片、Storage、Cron、自动备份、正式章节、知识点、搜索或 Word 导出。旧版项目位于同级目录 `讲义网站`，本项目没有复制或迁移旧数据。
+## GitHub Pages
+
+`.github/workflows/deploy-pages.yml` 会在 `main` 分支更新后构建并部署。GitHub Pages 子路径使用 `/english-handout-workbench/`，生产构建会自动设置 Vite base path。
+
+LocalStorage 只用于保存尚未成功上传的临时草稿；正常联网时云端内容优先。

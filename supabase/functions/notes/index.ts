@@ -1,5 +1,4 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
 
 type Stage1Note = {
   id: string;
@@ -19,17 +18,45 @@ const MAX_TITLE_LENGTH = 200;
 const MAX_CONTENT_LENGTH = 200_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function json(
-  response: VercelResponse,
-  status: number,
-  body: Record<string, unknown>,
-) {
-  response.status(status).setHeader("Cache-Control", "no-store").json(body);
+const allowedOrigins = new Set([
+  "https://zhangyoyang-ux.github.io",
+  "http://localhost:5173",
+  "http://127.0.0.1:4173",
+  ...(Deno.env.get("ALLOWED_ORIGINS") ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+]);
+
+function responseHeaders(request: Request) {
+  const origin = request.headers.get("Origin");
+  return {
+    "Access-Control-Allow-Origin": origin && allowedOrigins.has(origin)
+      ? origin
+      : "https://zhangyoyang-ux.github.io",
+    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
+    "Cache-Control": "no-store",
+    "Content-Type": "application/json; charset=utf-8",
+    Vary: "Origin",
+  };
+}
+
+function json(request: Request, status: number, body: Record<string, unknown>) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: responseHeaders(request),
+  });
+}
+
+function originIsAllowed(request: Request) {
+  const origin = request.headers.get("Origin");
+  return !origin || allowedOrigins.has(origin);
 }
 
 function getSupabaseClient(): SupabaseClient {
-  const url = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const url = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
   if (!url || !serviceRoleKey) {
     throw new Error("Supabase server environment variables are not configured.");
@@ -38,14 +65,6 @@ function getSupabaseClient(): SupabaseClient {
   return createClient(url, serviceRoleKey, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
-}
-
-function parseBody(request: VercelRequest): NotePayload {
-  if (typeof request.body === "string") {
-    return JSON.parse(request.body) as NotePayload;
-  }
-
-  return (request.body ?? {}) as NotePayload;
 }
 
 function validatePayload(payload: NotePayload) {
@@ -61,11 +80,7 @@ function validatePayload(payload: NotePayload) {
     return `正文不能超过 ${MAX_CONTENT_LENGTH} 个字符。`;
   }
 
-  if (payload.id !== undefined && typeof payload.id !== "string") {
-    return "知识记录 ID 格式不正确。";
-  }
-
-  if (payload.id !== undefined && !UUID_PATTERN.test(payload.id)) {
+  if (payload.id !== undefined && (typeof payload.id !== "string" || !UUID_PATTERN.test(payload.id))) {
     return "知识记录 ID 格式不正确。";
   }
 
@@ -80,78 +95,76 @@ async function readLatestNote(client: SupabaseClient) {
     .limit(1);
 }
 
-export default async function handler(
-  request: VercelRequest,
-  response: VercelResponse,
-) {
-  if (request.method === "OPTIONS") {
-    response.status(204).end();
-    return;
+Deno.serve(async (request) => {
+  if (!originIsAllowed(request)) {
+    return json(request, 403, {
+      ok: false,
+      error: { code: "CORS_ORIGIN_NOT_ALLOWED", message: "请求来源不被允许。" },
+    });
   }
 
-  if (request.method !== "GET" && request.method !== "PUT") {
-    response.setHeader("Allow", "GET, PUT, OPTIONS");
-    json(response, 405, {
+  if (request.method === "OPTIONS") {
+    return new Response("ok", { status: 204, headers: responseHeaders(request) });
+  }
+
+  if (!["GET", "POST", "PUT", "PATCH"].includes(request.method)) {
+    return json(request, 405, {
       ok: false,
       error: { code: "METHOD_NOT_ALLOWED", message: "不支持该请求方法。" },
     });
-    return;
   }
 
   let client: SupabaseClient;
   try {
     client = getSupabaseClient();
   } catch {
-    json(response, 503, {
+    return json(request, 503, {
       ok: false,
       error: {
         code: "SERVER_CONFIG_ERROR",
-        message: "服务端数据库尚未配置，请检查 Supabase 环境变量。",
+        message: "Edge Function 服务端数据库尚未配置。",
       },
     });
-    return;
   }
 
   if (request.method === "GET") {
     try {
       const { data, error } = await readLatestNote(client);
-
       if (error) {
-        json(response, 500, {
+        return json(request, 500, {
           ok: false,
           error: { code: "DATABASE_READ_ERROR", message: "读取云端内容失败。" },
         });
-        return;
       }
 
-      json(response, 200, { ok: true, note: (data?.[0] as Stage1Note | undefined) ?? null });
+      return json(request, 200, {
+        ok: true,
+        note: (data?.[0] as Stage1Note | undefined) ?? null,
+      });
     } catch {
-      json(response, 500, {
+      return json(request, 500, {
         ok: false,
         error: { code: "SERVICE_ERROR", message: "读取服务暂时不可用。" },
       });
     }
-    return;
   }
 
   let payload: NotePayload;
   try {
-    payload = parseBody(request);
+    payload = await request.json() as NotePayload;
   } catch {
-    json(response, 400, {
+    return json(request, 400, {
       ok: false,
       error: { code: "INVALID_JSON", message: "请求内容不是有效 JSON。" },
     });
-    return;
   }
 
   const validationError = validatePayload(payload);
   if (validationError) {
-    json(response, 400, {
+    return json(request, 400, {
       ok: false,
       error: { code: "VALIDATION_ERROR", message: validationError },
     });
-    return;
   }
 
   const values = {
@@ -168,18 +181,17 @@ export default async function handler(
       .single();
 
     if (error) {
-      json(response, 500, {
+      return json(request, 500, {
         ok: false,
         error: { code: "DATABASE_WRITE_ERROR", message: "保存到云端失败。" },
       });
-      return;
     }
 
-    json(response, 200, { ok: true, note: data as Stage1Note });
+    return json(request, 200, { ok: true, note: data as Stage1Note });
   } catch {
-    json(response, 500, {
+    return json(request, 500, {
       ok: false,
       error: { code: "SERVICE_ERROR", message: "保存服务暂时不可用。" },
     });
   }
-}
+});

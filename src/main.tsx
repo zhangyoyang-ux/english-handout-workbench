@@ -20,6 +20,8 @@ type ApiResponse = {
 
 const DRAFT_KEY = "english-handout-workbench:stage1:unsaved-draft";
 const AUTOSAVE_DELAY = 800;
+const NOTES_FUNCTION_URL = import.meta.env.VITE_NOTES_FUNCTION_URL ??
+  "https://dtcrxkdjzrklrhtxosxn.supabase.co/functions/v1/notes";
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "网络连接异常，请稍后重试。";
@@ -113,7 +115,7 @@ function App() {
 
     async function loadNote() {
       try {
-        const result = await requestJson("/api/notes");
+        const result = await requestJson(NOTES_FUNCTION_URL);
         if (cancelled) return;
 
         if (result.note) {
@@ -175,7 +177,7 @@ function App() {
       setMessage("");
 
       try {
-        const result = await requestJson("/api/notes", {
+        const result = await requestJson(NOTES_FUNCTION_URL, {
           method: "PUT",
           body: JSON.stringify({ id: noteIdRef.current, title, content }),
         });
