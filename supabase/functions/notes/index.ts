@@ -104,7 +104,7 @@ Deno.serve(async (request) => {
   }
 
   if (request.method === "OPTIONS") {
-    return new Response("ok", { status: 204, headers: responseHeaders(request) });
+    return new Response(null, { status: 204, headers: responseHeaders(request) });
   }
 
   if (!["GET", "POST", "PUT", "PATCH"].includes(request.method)) {
