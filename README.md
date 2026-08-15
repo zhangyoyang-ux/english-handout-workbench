@@ -15,7 +15,9 @@
 1. 复制 `.env.example` 为 `.env`。
 2. 填入新的 Supabase 项目 URL 与仅服务端使用的 `SUPABASE_SERVICE_ROLE_KEY`。
 3. 在新的 Supabase 项目执行 `supabase/migrations/0001_stage1_notes.sql`。
-4. 运行 `npm install`、`npm run dev`。
+4. 运行 `npm install`、`npm run dev` 可以预览前端页面。
+
+`npm run dev` 是 Vite 前端预览，不会在本地自动托管 Vercel 的 `/api/notes` Server Function；本地要联调真实 API，需要使用已连接 Vercel 项目的本地运行方式。正式验收以 Vercel Production 为准。
 
 浏览器只访问 `/api/notes`，不会持有高权限数据库 Secret。LocalStorage 只保存尚未成功上传的临时草稿；云端内容优先。
 
