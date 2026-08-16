@@ -226,7 +226,17 @@ type SaveFilePickerWindow = Window & {
 };
 
 const EMPTY_TREE: TreeData = { chapters: [], knowledge_points: [], knowledge_point_placements: [] };
-const AUTOSAVE_DELAY = 1300;
+const AUTOSAVE_INTERVAL_KEY = "autosave_interval_ms";
+const AUTOSAVE_INTERVAL_OPTIONS = [
+  { value: 0, label: "关闭" },
+  { value: 60_000, label: "1 分钟" },
+  { value: 180_000, label: "3 分钟" },
+  { value: 300_000, label: "5 分钟" },
+  { value: 600_000, label: "10 分钟" },
+  { value: 900_000, label: "15 分钟" },
+  { value: 1_800_000, label: "30 分钟" },
+] as const;
+const DEFAULT_AUTOSAVE_INTERVAL_MS = 300_000;
 const EXPANDED_KEY = "english-handout-workbench:phase2:expanded";
 const NOTES_FUNCTION_URL = import.meta.env.VITE_NOTES_FUNCTION_URL ?? "https://dtcrxkdjzrklrhtxosxn.supabase.co/functions/v1/notes";
 const CONTENT_DRAFT_PREFIX = "english-handout-workbench:phase3:content:";
@@ -411,6 +421,13 @@ function readExpandedIds() {
     return new Set<string>(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : []);
   } catch { return new Set<string>(); }
 }
+function readAutosaveInterval() {
+  try {
+    const raw = window.localStorage.getItem(AUTOSAVE_INTERVAL_KEY);
+    const value = raw === null ? DEFAULT_AUTOSAVE_INTERVAL_MS : Number(raw);
+    return AUTOSAVE_INTERVAL_OPTIONS.some((option) => option.value === value) ? value : DEFAULT_AUTOSAVE_INTERVAL_MS;
+  } catch { return DEFAULT_AUTOSAVE_INTERVAL_MS; }
+}
 function saveStateLabel(state: SaveState) { return { idle: "等待编辑", dirty: "待保存", saving: "保存中", saved: "已保存", error: "保存失败", conflict: "有更新冲突" }[state]; }
 function pointStatusLabel(status: PointStatus) { return POINT_STATUS_LABELS[status]; }
 function matchTypeLabel(type: string) { return ({ title: "标题命中", explanation: "知识讲解命中", exercises: "例题命中", supplement: "补充内容命中", inspiration: "灵感命中", chapter_note: "本章补充命中", tag: "标签命中" } as Record<string, string>)[type] ?? type; }
@@ -522,6 +539,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState("");
+  const [autosaveIntervalMs, setAutosaveIntervalMs] = useState(readAutosaveInterval);
+  const [manualSaveBusy, setManualSaveBusy] = useState(false);
+  const [navigationGuardOpen, setNavigationGuardOpen] = useState(false);
+  const [navigationGuardSaving, setNavigationGuardSaving] = useState(false);
   const [contentRecord, setContentRecord] = useState<KnowledgePointContent | null>(null);
   const [contentDraft, setContentDraft] = useState<ContentDraft>(emptyContentDraft);
   const [contentSyncVersion, setContentSyncVersion] = useState(0);
@@ -620,8 +641,33 @@ function App() {
   const placementEditSessionRef = useRef<{ key: string; snapshot: RichDocument; captured: boolean } | null>(null);
   const offlineSnapshotRef = useRef<OfflineSnapshot | null>(null);
   const offlineRefreshTimerRef = useRef<number | null>(null);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const autosavePendingAfterCompositionRef = useRef(false);
+  const compositionActiveRef = useRef(false);
+  const saveAllRequestRef = useRef<Promise<boolean> | null>(null);
+  const saveAllDirtyRef = useRef<(kind: "manual" | "autosave") => Promise<boolean>>(async () => false);
+  const navigationContinuationRef = useRef<(() => void) | null>(null);
 
   const canWriteOnline = online && !offlineReading;
+
+  const hasAnyUnsavedChanges = () => contentDirtyRef.current || chapterDirtyRef.current || chapterNoteDirtyRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0;
+  const armAutosaveTimer = useCallback(() => {
+    if (autosaveIntervalMs <= 0 || autosaveTimerRef.current !== null || !hasAnyUnsavedChanges()) return;
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = null;
+      if (!hasAnyUnsavedChanges()) return;
+      if (compositionActiveRef.current) {
+        autosavePendingAfterCompositionRef.current = true;
+        return;
+      }
+      void saveAllDirtyRef.current("autosave");
+    }, autosaveIntervalMs);
+  }, [autosaveIntervalMs]);
+  const resetAutosaveTimer = useCallback(() => {
+    if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = null;
+    armAutosaveTimer();
+  }, [armAutosaveTimer]);
 
   const selectedChapter = tree.chapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
   const selectedKnowledgePoint = tree.knowledge_points.find((point) => point.id === selectedKnowledgePointId) ?? null;
@@ -1087,18 +1133,19 @@ function App() {
     setMessage("检测到内容更新冲突。当前输入已保留在本机草稿中。");
   }, [persistConflictDraft]);
 
-  const flushChapterSave = useCallback(async (chapterId: string) => {
-    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，章节修改已暂存在本机，联网后才会同步。"); return; }
+  const flushChapterSave = useCallback(async (chapterId: string): Promise<boolean> => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，章节修改已暂存在本机，联网后才会同步。"); return false; }
     if (chapterSaveInFlightRef.current) {
       chapterSaveQueuedRef.current = true;
-      return;
+      return false;
     }
-    if (chapterId !== selectedChapterId || !chapterDirtyRef.current || chapterSavePaused || overviewRevisionRef.current === null) return;
+    if (chapterId !== selectedChapterId || !chapterDirtyRef.current || chapterSavePaused || overviewRevisionRef.current === null) return !chapterDirtyRef.current;
     const contentAtStart = chapterContentRef.current;
     const saveStartSeq = chapterEditSeqRef.current;
     const baseRevision = overviewRevisionRef.current;
     const conflictBase: ConflictInfo = { entity: "chapter_overview", entityId: chapterId, baseRevision, currentRevision: baseRevision, updatedAt: null };
     let conflicted = false;
+    let saved = false;
     chapterSaveInFlightRef.current = true;
     setSaveState("saving");
     setMessage("");
@@ -1107,7 +1154,7 @@ function App() {
         method: "PATCH",
         body: JSON.stringify({ content: contentAtStart, expected_revision: baseRevision }),
       });
-      if (chapterId !== selectedChapterId) return;
+       if (chapterId !== selectedChapterId) return false;
       overviewRevisionRef.current = result.chapter.overview_revision;
       setTree((previous) => ({
         ...previous,
@@ -1122,9 +1169,10 @@ function App() {
         chapterSaveQueuedRef.current = true;
       }
       setSaveState(contentDirtyRef.current || chapterNoteDirtyRef.current || chapterDirtyRef.current ? "dirty" : "saved");
-      setMessage(hasNewerEdits ? "上一轮章节内容已保存，正在继续同步最新输入。" : "章节内容已保存到 Supabase PostgreSQL。");
-      refreshFastAccess();
-      scheduleOfflineSnapshotRefresh();
+       setMessage(hasNewerEdits ? "上一轮章节内容已保存，正在继续同步最新输入。" : "章节内容已保存到 Supabase PostgreSQL。");
+       refreshFastAccess();
+       scheduleOfflineSnapshotRefresh();
+       saved = true;
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -1138,21 +1186,18 @@ function App() {
       }
     } finally {
       chapterSaveInFlightRef.current = false;
-      if (!conflicted && !chapterSavePaused && (chapterSaveQueuedRef.current || chapterDirtyRef.current)) {
-        chapterSaveQueuedRef.current = false;
-        window.setTimeout(() => { void flushChapterSave(chapterId); }, AUTOSAVE_DELAY);
-      }
     }
+    return saved && !conflicted;
   }, [canWriteOnline, chapterSavePaused, contentDirtyRef, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedChapterId]);
 
-  const flushContentSave = useCallback(async (pointId: string) => {
-    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，当前输入已暂存在本机，联网后才会同步。"); return; }
+  const flushContentSave = useCallback(async (pointId: string): Promise<boolean> => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，当前输入已暂存在本机，联网后才会同步。"); return false; }
     if (contentSaveInFlightRef.current) {
       contentSaveQueuedRef.current = true;
-      return;
+      return false;
     }
     const hasMetadataPatch = Object.keys(pendingCoreMetadataRef.current).length > 0;
-    if (pointId !== selectedKnowledgePointId || (!contentDirtyRef.current && !hasMetadataPatch) || (pendingContentFieldsRef.current.size === 0 && !hasMetadataPatch) || coreSavePaused || coreRevisionRef.current === null) return;
+    if (pointId !== selectedKnowledgePointId || (!contentDirtyRef.current && !hasMetadataPatch) || (pendingContentFieldsRef.current.size === 0 && !hasMetadataPatch) || coreSavePaused || coreRevisionRef.current === null) return !contentDirtyRef.current && !hasMetadataPatch;
     const fieldsAtStart = [...pendingContentFieldsRef.current];
     const metadataAtStart = { ...pendingCoreMetadataRef.current };
     const payload: Partial<Pick<KnowledgePoint, "title" | "status">> & Partial<ContentDraft> = { ...metadataAtStart };
@@ -1161,6 +1206,7 @@ function App() {
     const saveStartSeq = contentEditSeqRef.current;
     const conflictBase: ConflictInfo = { entity: "knowledge_point_core", entityId: pointId, baseRevision, currentRevision: baseRevision, updatedAt: null };
     let conflicted = false;
+    let saved = false;
     contentSaveInFlightRef.current = true;
     setSaveState("saving");
     setMessage("");
@@ -1169,7 +1215,7 @@ function App() {
         method: "PATCH",
         body: JSON.stringify({ ...payload, expected_revision: baseRevision }),
       });
-      if (pointId !== selectedKnowledgePointId) return;
+       if (pointId !== selectedKnowledgePointId) return false;
       coreRevisionRef.current = result.knowledge_point.core_revision;
       setTree((previous) => ({
         ...previous,
@@ -1191,9 +1237,10 @@ function App() {
         contentSaveQueuedRef.current = true;
       }
       setSaveState(stillDirty || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
-      setMessage(hasNewerEdits ? "上一轮内容已保存，正在继续同步最新输入。" : "共享核心已保存到 Supabase PostgreSQL。");
-      refreshFastAccess();
-      scheduleOfflineSnapshotRefresh();
+       setMessage(hasNewerEdits ? "上一轮内容已保存，正在继续同步最新输入。" : "共享核心已保存到 Supabase PostgreSQL。");
+       refreshFastAccess();
+       scheduleOfflineSnapshotRefresh();
+       saved = true;
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -1207,25 +1254,23 @@ function App() {
       }
     } finally {
       contentSaveInFlightRef.current = false;
-      if (!conflicted && !coreSavePaused && (contentSaveQueuedRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0)) {
-        contentSaveQueuedRef.current = false;
-        window.setTimeout(() => { void flushContentSave(pointId); }, AUTOSAVE_DELAY);
-      }
     }
+    return saved && !conflicted;
   }, [canWriteOnline, coreSavePaused, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedKnowledgePointId]);
 
-  const flushNoteSave = useCallback(async (placementId: string) => {
-    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，本章补充已暂存在本机，联网后才会同步。"); return; }
+  const flushNoteSave = useCallback(async (placementId: string): Promise<boolean> => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，本章补充已暂存在本机，联网后才会同步。"); return false; }
     if (noteSaveInFlightRef.current) {
       noteSaveQueuedRef.current = true;
-      return;
+      return false;
     }
-    if (placementId !== selectedPlacementId || !chapterNoteDirtyRef.current || noteSavePaused || noteRevisionRef.current === null) return;
+    if (placementId !== selectedPlacementId || !chapterNoteDirtyRef.current || noteSavePaused || noteRevisionRef.current === null) return !chapterNoteDirtyRef.current;
     const noteAtStart = chapterNoteDraftRef.current;
     const saveStartSeq = chapterNoteEditSeqRef.current;
     const baseRevision = noteRevisionRef.current;
     const conflictBase: ConflictInfo = { entity: "placement_note", entityId: placementId, baseRevision, currentRevision: baseRevision, updatedAt: null };
     let conflicted = false;
+    let saved = false;
     noteSaveInFlightRef.current = true;
     setSaveState("saving");
     setMessage("");
@@ -1234,7 +1279,7 @@ function App() {
         method: "PATCH",
         body: JSON.stringify({ chapter_note: noteAtStart, expected_revision: baseRevision }),
       });
-      if (placementId !== selectedPlacementId) return;
+       if (placementId !== selectedPlacementId) return false;
       noteRevisionRef.current = result.placement.note_revision;
       setTree((previous) => ({
         ...previous,
@@ -1249,9 +1294,10 @@ function App() {
         noteSaveQueuedRef.current = true;
       }
       setSaveState(contentDirtyRef.current || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
-      setMessage(hasNewerEdits ? "上一轮本章补充已保存，正在继续同步最新输入。" : "本章补充已保存到 Supabase PostgreSQL。");
-      refreshFastAccess();
-      scheduleOfflineSnapshotRefresh();
+       setMessage(hasNewerEdits ? "上一轮本章补充已保存，正在继续同步最新输入。" : "本章补充已保存到 Supabase PostgreSQL。");
+       refreshFastAccess();
+       scheduleOfflineSnapshotRefresh();
+       saved = true;
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -1265,12 +1311,84 @@ function App() {
       }
     } finally {
       noteSaveInFlightRef.current = false;
-      if (!conflicted && !noteSavePaused && (noteSaveQueuedRef.current || chapterNoteDirtyRef.current)) {
-        noteSaveQueuedRef.current = false;
-        window.setTimeout(() => { void flushNoteSave(placementId); }, AUTOSAVE_DELAY);
-      }
     }
+    return saved && !conflicted;
   }, [canWriteOnline, contentDirtyRef, chapterDirtyRef, noteSavePaused, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedPlacementId]);
+
+  const waitForCloudSaves = async () => {
+    while (contentSaveInFlightRef.current || chapterSaveInFlightRef.current || noteSaveInFlightRef.current) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 25));
+    }
+  };
+
+  const saveAllDirty = useCallback(async (kind: "manual" | "autosave"): Promise<boolean> => {
+    if (!canWriteOnline) {
+      setSaveState("error");
+      setMessage("网络已断开，当前输入已暂存在本机，联网后才会同步。");
+      return false;
+    }
+    while (saveAllRequestRef.current) await saveAllRequestRef.current;
+    const request = (async () => {
+      if (kind === "manual") setManualSaveBusy(true);
+      let allSaved = true;
+      try {
+        const pointId = selectedKnowledgePointId;
+        const placementId = selectedPlacementId;
+        const chapterId = selectedChapterId;
+        if (pointId && selectedKnowledgePoint) {
+          const latestTitle = titleDraft.trim();
+          titleDraftRef.current = latestTitle;
+          if (latestTitle && latestTitle !== selectedKnowledgePoint.title && pendingCoreMetadataRef.current.title !== latestTitle) {
+            pendingCoreMetadataRef.current = { ...pendingCoreMetadataRef.current, title: latestTitle };
+            contentEditSeqRef.current += 1;
+            contentDirtyRef.current = true;
+            setContentDirty(true);
+            try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${pointId}`, JSON.stringify({ entity_id: pointId, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: latestTitle, status: pointStatusDraftRef.current, content: contentDraftRef.current } })); } catch { /* Temporary protection is best effort. */ }
+          }
+        }
+        const pageHasDirty = () => pointId
+          ? contentDirtyRef.current || chapterNoteDirtyRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0
+          : Boolean(chapterId && chapterDirtyRef.current);
+        if (!pageHasDirty()) {
+          setSaveState("saved");
+          resetAutosaveTimer();
+          return true;
+        }
+        setSaveState("saving");
+        setMessage("");
+        for (let pass = 0; pass < 2 && pageHasDirty(); pass += 1) {
+          await waitForCloudSaves();
+          if (pointId) {
+            if (contentDirtyRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0) {
+              if (!(await flushContentSave(pointId))) allSaved = false;
+            }
+            await waitForCloudSaves();
+            if (placementId && chapterNoteDirtyRef.current) {
+              if (!(await flushNoteSave(placementId))) allSaved = false;
+            }
+          } else if (chapterId && chapterDirtyRef.current) {
+            if (!(await flushChapterSave(chapterId))) allSaved = false;
+          }
+          if (!allSaved) break;
+        }
+        const complete = allSaved && !pageHasDirty();
+        if (complete) {
+          setSaveState("saved");
+          setMessage("已保存到 Supabase PostgreSQL。");
+        } else if (allSaved) {
+          setSaveState("dirty");
+          setMessage("已保存上一轮修改，当前仍有新的未保存输入。");
+        }
+        resetAutosaveTimer();
+        return complete;
+      } finally {
+        if (kind === "manual") setManualSaveBusy(false);
+      }
+    })();
+    saveAllRequestRef.current = request;
+    try { return await request; } finally { if (saveAllRequestRef.current === request) saveAllRequestRef.current = null; }
+  }, [canWriteOnline, flushChapterSave, flushContentSave, flushNoteSave, resetAutosaveTimer, selectedChapterId, selectedKnowledgePoint, selectedKnowledgePointId, selectedPlacementId, titleDraft]);
+  saveAllDirtyRef.current = saveAllDirty;
 
   const applyFreshPointResult = useCallback((result: { knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }) => {
     setContentSyncVersion((version) => version + 1);
@@ -1484,7 +1602,7 @@ function App() {
 
   useEffect(() => {
     if (!selectedChapter || selectedKnowledgePointId) return;
-    chapterContentRef.current = selectedChapter.content;
+    if (!chapterDirtyRef.current || chapterSavePaused) chapterContentRef.current = selectedChapter.content;
     if (loadedChapterIdRef.current !== selectedChapter.id) {
       loadedChapterIdRef.current = selectedChapter.id;
       overviewRevisionRef.current = selectedChapter.overview_revision;
@@ -1494,12 +1612,7 @@ function App() {
       setSaveState("saved");
       return;
     }
-    if (!chapterDirtyRef.current || chapterSavePaused) return;
-    const draftKey = `english-handout-workbench:phase2:chapter:${selectedChapter.id}`;
-    try { window.localStorage.setItem(draftKey, JSON.stringify({ content: chapterContentRef.current, savedAt: new Date().toISOString(), base_revision: overviewRevisionRef.current })); } catch { /* Cloud remains the source of truth. */ }
-    const timer = window.setTimeout(() => { void flushChapterSave(selectedChapter.id); }, AUTOSAVE_DELAY);
-    return () => window.clearTimeout(timer);
-  }, [chapterSavePaused, flushChapterSave, selectedChapter, selectedKnowledgePointId]);
+  }, [chapterSavePaused, selectedChapter, selectedKnowledgePointId]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
@@ -1604,24 +1717,51 @@ function App() {
   }, [selectedPlacement, selectedPlacementId, selectedPlacementNote]);
 
   useEffect(() => {
-    const pointId = selectedKnowledgePointId;
-    const hasMetadataPatch = Object.keys(pendingCoreMetadataRef.current).length > 0;
-    if (!pointId || (!contentDirty && !hasMetadataPatch) || (pendingContentFieldsRef.current.size === 0 && !hasMetadataPatch) || coreSavePaused) return;
-    const timer = window.setTimeout(() => { void flushContentSave(pointId); }, AUTOSAVE_DELAY);
-    return () => window.clearTimeout(timer);
-  }, [contentDirty, coreSavePaused, flushContentSave, selectedKnowledgePointId]);
+    if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = null;
+    try { window.localStorage.setItem(AUTOSAVE_INTERVAL_KEY, String(autosaveIntervalMs)); } catch { /* Local preference is best effort. */ }
+    armAutosaveTimer();
+    return () => {
+      if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    };
+  }, [armAutosaveTimer, autosaveIntervalMs]);
 
   useEffect(() => {
-    const placementId = selectedPlacementId;
-    if (!placementId || !chapterNoteDirty || noteSavePaused) return;
-    const timer = window.setTimeout(() => { void flushNoteSave(placementId); }, AUTOSAVE_DELAY);
-    return () => window.clearTimeout(timer);
-  }, [chapterNoteDirty, flushNoteSave, noteSavePaused, selectedPlacementId]);
+    const onCompositionStart = () => { compositionActiveRef.current = true; };
+    const onCompositionEnd = () => {
+      compositionActiveRef.current = false;
+      if (autosavePendingAfterCompositionRef.current) {
+        autosavePendingAfterCompositionRef.current = false;
+        if (hasAnyUnsavedChanges()) void saveAllDirtyRef.current("autosave");
+      } else {
+        armAutosaveTimer();
+      }
+    };
+    document.addEventListener("compositionstart", onCompositionStart, true);
+    document.addEventListener("compositionend", onCompositionEnd, true);
+    return () => {
+      document.removeEventListener("compositionstart", onCompositionStart, true);
+      document.removeEventListener("compositionend", onCompositionEnd, true);
+    };
+  }, [armAutosaveTimer, autosaveIntervalMs]);
 
   const childrenOf = (parentId: string | null) => sortByOrder(tree.chapters.filter((chapter) => chapter.parent_id === parentId));
   const placementsOf = (chapterId: string) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.chapter_id === chapterId));
-  const selectChapter = (chapterId: string) => { setSelectedChapterId(chapterId); setSelectedKnowledgePointId(null); setViewMode("read"); };
-  const selectKnowledgePoint = (placement: Placement) => { setSelectedChapterId(placement.chapter_id); setSelectedKnowledgePointId(placement.knowledge_point_id); setViewMode("read"); };
+  const updateAutosaveInterval = (value: number) => {
+    if (!AUTOSAVE_INTERVAL_OPTIONS.some((option) => option.value === value)) return;
+    setAutosaveIntervalMs(value);
+  };
+  const requestNavigation = (action: () => void) => {
+    if (!hasAnyUnsavedChanges()) { action(); return; }
+    navigationContinuationRef.current = action;
+    setNavigationGuardOpen(true);
+    setNavigationGuardSaving(false);
+  };
+  const commitSelectChapter = (chapterId: string) => { setSelectedChapterId(chapterId); setSelectedKnowledgePointId(null); setViewMode("read"); };
+  const commitSelectKnowledgePoint = (placement: Placement) => { setSelectedChapterId(placement.chapter_id); setSelectedKnowledgePointId(placement.knowledge_point_id); setViewMode("read"); };
+  const selectChapter = (chapterId: string) => requestNavigation(() => commitSelectChapter(chapterId));
+  const selectKnowledgePoint = (placement: Placement) => requestNavigation(() => commitSelectKnowledgePoint(placement));
   const openAccessItem = (item: Pick<AccessItem, "item_type" | "item_id" | "chapter_id" | "placement_id">) => {
     setSearchQuery("");
     setMobileSearchOpen(false);
@@ -1634,7 +1774,7 @@ function App() {
       ?? tree.knowledge_point_placements.find((candidate) => candidate.knowledge_point_id === item.item_id && candidate.chapter_id === item.chapter_id)
       ?? tree.knowledge_point_placements.find((candidate) => candidate.knowledge_point_id === item.item_id);
     if (placement) selectKnowledgePoint(placement);
-    else { setSelectedChapterId(item.chapter_id); setSelectedKnowledgePointId(item.item_id); setViewMode("read"); }
+    else requestNavigation(() => { setSelectedChapterId(item.chapter_id); setSelectedKnowledgePointId(item.item_id); setViewMode("read"); });
   };
   const openSearchResult = (result: SearchResult) => {
     const contextPlacementId = result.context?.placement_id ?? result.placement_id;
@@ -1845,6 +1985,7 @@ function App() {
     setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === selectedChapterId ? { ...chapter, content } : chapter) }));
     setChapterDirty(true);
     setSaveState("dirty");
+    armAutosaveTimer();
     try { window.localStorage.setItem(`english-handout-workbench:phase2:chapter:${selectedChapterId}`, JSON.stringify({ content, savedAt: new Date().toISOString(), base_revision: overviewRevisionRef.current })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateContentSection = (section: ContentSection, value: RichDocument) => {
@@ -1859,6 +2000,7 @@ function App() {
     setContentDraft(nextDraft);
     setContentDirty(true);
     setSaveState("dirty");
+    armAutosaveTimer();
     try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePointId}`, JSON.stringify({ entity_id: selectedKnowledgePointId, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: nextDraft } })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateChapterNote = (value: RichDocument) => {
@@ -1872,6 +2014,7 @@ function App() {
     chapterNoteEditSeqRef.current += 1;
     chapterNoteDirtyRef.current = true;
     setChapterNoteDraft(value); setChapterNoteDirty(true); setSaveState("dirty");
+    armAutosaveTimer();
     try { window.localStorage.setItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${selectedPlacement.id}`, JSON.stringify({ entity_id: selectedPlacement.id, entity_type: "placement_note", base_revision: noteRevisionRef.current, saved_at: new Date().toISOString(), draft: { value } })); } catch { /* Temporary protection is best effort. */ }
   };
   const savePointMetadata = async (patch: Partial<Pick<KnowledgePoint, "title" | "status">>) => {
@@ -1887,6 +2030,7 @@ function App() {
     contentDirtyRef.current = true;
     setContentDirty(true);
     setSaveState("dirty");
+    armAutosaveTimer();
     try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePoint.id}`, JSON.stringify({ entity_id: selectedKnowledgePoint.id, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: contentDraftRef.current } })); } catch { /* Temporary protection is best effort. */ }
   };
   const navigateKnowledgePoint = (offset: -1 | 1) => {
@@ -1957,7 +2101,7 @@ function App() {
     if (!selectedChapter) return <EmptyState onCreateRoot={() => createChapter(null)} />;
     const children = childrenOf(selectedChapter.id); const placements = placementsOf(selectedChapter.id);
     const hasOverview = Boolean(selectedChapter.content.trim());
-    return <div className="chapter-page"><div className="content-heading chapter-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2></div><div className="content-heading__tools"><button type="button" className="secondary-button chapter-new-child" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button><SaveBadge state={saveState} /><details className="more-menu"><summary aria-label="章节更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportChapter()}>导出本章 Word</button><button type="button" onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button type="button" onClick={() => renameChapter(selectedChapter)}>重命名</button><button type="button" onClick={() => deleteChapter(selectedChapter)} className="more-menu__danger">删除章节</button></>}</div></details></div></div>
+    return <div className="chapter-page"><div className="content-heading chapter-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2></div><div className="content-heading__tools"><button type="button" className="secondary-button chapter-new-child" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button>{renderSaveControls(chapterEditMode)}<SaveBadge state={saveState} /><details className="more-menu"><summary aria-label="章节更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportChapter()}>导出本章 Word</button><button type="button" onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button type="button" onClick={() => renameChapter(selectedChapter)}>重命名</button><button type="button" onClick={() => deleteChapter(selectedChapter)} className="more-menu__danger">删除章节</button></>}</div></details></div></div>
       {organizeMode && <p className="organize-context">整理模式已开启</p>}
       {organizeMode && <div className="move-panel"><label htmlFor="chapter-move">移动章节到</label><select id="chapter-move" value={selectedChapter.parent_id ?? ""} disabled={busy} onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}><option value="">一级目录</option>{possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{chapterPath(parent.id)}</option>)}</select></div>}
       <section className="chapter-overview"><div className="section-heading"><h3>章节总览</h3>{hasOverview && !chapterEditMode && <button type="button" className="text-link" onClick={beginChapterEdit}>编辑</button>}</div>{chapterEditMode ? <><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><button type="button" className="quiet-button overview-done" onClick={() => setChapterEditMode(false)}>完成</button></> : hasOverview ? <div className="chapter-overview__text">{selectedChapter.content}</div> : <button type="button" className="add-overview" onClick={beginChapterEdit}>＋ 添加章节说明</button>}</section>
@@ -1976,13 +2120,13 @@ function App() {
     const hasChapterNote = documentHasText(chapterNoteDraft);
     return <div className="knowledge-point-page">
       <div className="content-heading"><div>{viewMode === "edit" ? <><p className="content-kicker">知识点 · 编辑</p><input className="point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /></> : <><p className="content-kicker">知识点 · 阅读</p><h2>{selectedKnowledgePoint.title}</h2></>}<p className="content-hint">当前 placement：{selectedChapter ? chapterPath(selectedChapter.id) : "当前目录"}</p></div><SaveBadge state={saveState} /></div>
-      <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportKnowledgePoint()}>导出 Word</button><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button type="button" onClick={() => openHistory("shared")}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => openHistory("placement")}>本章补充历史</button>}{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
+       <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select>{renderSaveControls(true)}<button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportKnowledgePoint()}>导出 Word</button><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button type="button" onClick={() => openHistory("shared")}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => openHistory("placement")}>本章补充历史</button>}{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
       <div className="tag-strip"><span className="tag-strip__label">标签</span>{(pointMeta?.tags ?? []).map((tag) => <span className="tag-chip" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length === 0 && <span className="empty-line">暂无标签</span>}{viewMode === "edit" && <button type="button" className="quiet-button tag-edit-button" onClick={() => setTagPickerOpen((value) => !value)}>{tagPickerOpen ? "收起标签" : "编辑标签"}</button>}</div>
       {tagPickerOpen && viewMode === "edit" && <div className="tag-picker"><div className="tag-picker__options">{tags.map((tag) => <label className="tag-option" key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="reference-picker"><div className="reference-picker__header"><div><strong>选择目标章节</strong><span>只新增 placement，共享核心不复制。</span></div><button type="button" className="quiet-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><div className="reference-picker__tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
       <details className="placements-disclosure"><summary><span>所在章节</span><strong>{pointPlacements.length} 个位置</strong></summary><div className="placements-panel"><div className="placement-links">{pointPlacements.map((placement) => <button type="button" className={placement.id === selectedPlacement?.id ? "placement-link placement-link--current" : "placement-link"} key={placement.id} onClick={() => selectKnowledgePoint(placement)}>{chapterPath(placement.chapter_id)}</button>)}</div></div></details>
       {organizeMode && selectedPlacement && <div className="move-panel"><label htmlFor="point-move">移动当前引用到章节</label><select id="point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
-      {contentLoading ? <div className="content-loading content-loading--compact">正在读取知识点内容……</div> : viewMode === "edit" ? <div className="content-edit-stack"><div className="content-group-heading"><div><h3>共享核心</h3><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} syncVersion={contentSyncVersion} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>自动保存</span></div><RichTextEditor value={chapterNoteDraft} syncVersion={contentSyncVersion} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack">{!hasReadableContent ? <div className="no-content-state"><span>○</span><p>{contentRecord ? "暂无内容" : "暂无内容，点击“编辑”开始整理。"}</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h3>共享核心</h3><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
+       {contentLoading ? <div className="content-loading content-loading--compact">正在读取知识点内容……</div> : viewMode === "edit" ? <div className="content-edit-stack"><div className="content-group-heading"><div><h3>共享核心</h3><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} syncVersion={contentSyncVersion} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>手动保存 · 按设置自动保存</span></div><RichTextEditor value={chapterNoteDraft} syncVersion={contentSyncVersion} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack">{!hasReadableContent ? <div className="no-content-state"><span>○</span><p>{contentRecord ? "暂无内容" : "暂无内容，点击“编辑”开始整理。"}</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h3>共享核心</h3><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
       <nav className="point-navigation" aria-label="知识点阅读导航"><button className="quiet-button" disabled={currentIndex <= 0} onClick={() => navigateKnowledgePoint(-1)}>上一篇</button><button className="secondary-button" onClick={() => selectChapter(selectedChapterId ?? "")}>返回目录</button><button className="quiet-button" disabled={currentIndex < 0 || currentIndex >= placements.length - 1} onClick={() => navigateKnowledgePoint(1)}>下一篇</button></nav>
     </div>;
   };
@@ -2066,12 +2210,78 @@ function App() {
     </div>;
   };
 
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!hasAnyUnsavedChanges()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (viewMode !== "edit" || offlineReading || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") return;
+      event.preventDefault();
+      void saveAllDirty("manual");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [offlineReading, saveAllDirty, viewMode]);
+
+  const renderSaveControls = (active: boolean) => active ? <div className="save-controls" aria-label="保存设置">
+    <button type="button" className="primary-button save-controls__button" disabled={manualSaveBusy} onClick={() => void saveAllDirty("manual")}>{manualSaveBusy ? "保存中…" : "保存"}</button>
+    <label className="save-controls__interval"><span>自动保存：</span><select value={autosaveIntervalMs} onChange={(event) => updateAutosaveInterval(Number(event.target.value))} aria-label="自动保存时间">{AUTOSAVE_INTERVAL_OPTIONS.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>
+  </div> : null;
+
+  const cancelNavigation = () => {
+    navigationContinuationRef.current = null;
+    setNavigationGuardOpen(false);
+    setNavigationGuardSaving(false);
+  };
+  const discardAndContinue = () => {
+    const action = navigationContinuationRef.current;
+    navigationContinuationRef.current = null;
+    setNavigationGuardOpen(false);
+    setNavigationGuardSaving(false);
+    action?.();
+  };
+  const saveAndContinue = async () => {
+    setNavigationGuardSaving(true);
+    const saved = await saveAllDirty("manual");
+    if (saved && !hasAnyUnsavedChanges()) {
+      const action = navigationContinuationRef.current;
+      navigationContinuationRef.current = null;
+      setNavigationGuardOpen(false);
+      setNavigationGuardSaving(false);
+      action?.();
+      return;
+    }
+    setNavigationGuardSaving(false);
+  };
+  const renderNavigationGuard = () => !navigationGuardOpen ? null : <div className="conflict-overlay" role="presentation">
+    <section className="conflict-surface navigation-guard-surface" role="dialog" aria-modal="true" aria-labelledby="navigation-guard-title">
+      <div className="conflict-surface__icon" aria-hidden="true">!</div>
+      <p className="content-kicker">离开编辑</p>
+      <h2 id="navigation-guard-title">当前还有未保存的修改</h2>
+      <p>保存成功后才会继续进入下一个页面。暂不保存会保留本机草稿，之后可以重新进入并恢复。</p>
+      <div className="conflict-surface__actions">
+        <button type="button" className="quiet-button" disabled={navigationGuardSaving} onClick={cancelNavigation}>取消</button>
+        <button type="button" className="secondary-button" disabled={navigationGuardSaving} onClick={discardAndContinue}>暂不保存并继续</button>
+        <button type="button" className="primary-button" disabled={navigationGuardSaving} onClick={() => void saveAndContinue()}>{navigationGuardSaving ? "保存中…" : "保存并继续"}</button>
+      </div>
+    </section>
+  </div>;
+
   const mobileGoHome = () => {
-    setSelectedChapterId(null);
-    setSelectedKnowledgePointId(null);
-    setOrganizeMode(false);
-    setMobileSearchOpen(false);
-    setMobileSheet(null);
+    requestNavigation(() => {
+      setSelectedChapterId(null);
+      setSelectedKnowledgePointId(null);
+      setOrganizeMode(false);
+      setMobileSearchOpen(false);
+      setMobileSheet(null);
+    });
   };
   const renderMobileAccessRow = (item: AccessItem, label?: string) => <button type="button" className="mobile-access-row" key={`${item.item_type}-${item.item_id}-${item.placement_id ?? ""}`} onClick={() => openAccessItem(item)}>
     <span className="mobile-access-row__main"><strong>{item.title}</strong><span>{item.path || label || (item.item_type === "chapter" ? "章节" : "知识点")}</span></span>
@@ -2117,7 +2327,7 @@ function App() {
       <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={mobileGoHome}>‹ 悠扬讲义</button><h1>{selectedChapter.title}</h1><div className="mobile-header__actions"><button type="button" className="mobile-icon-button mobile-child-create" aria-label="新建子章节" onClick={() => createChapter(selectedChapter.id)}>＋</button><button type="button" className="mobile-icon-button" aria-label="章节更多操作" onClick={() => setMobileSheet("chapter")}>···</button></div></header>
       {renderMobileMessage()}
       {selectedChapter.parent_id && <p className="mobile-path">{chapterPath(selectedChapter.id)}</p>}
-      <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={beginChapterEdit}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} /><button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={beginChapterEdit}>＋ 添加章节说明</button>}</section>
+      <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={beginChapterEdit}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} />{renderSaveControls(true)}<button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={beginChapterEdit}>＋ 添加章节说明</button>}</section>
       {children.length > 0 && <section className="mobile-chapter-section mobile-chapter-children-section"><div className="mobile-section-heading"><div><h2>子章节</h2><span>继续深入当前目录</span></div><span>{children.length}</span></div><div className="mobile-child-list">{children.map((child) => <button type="button" className="mobile-child-row" key={child.id} onClick={() => selectChapter(child.id)}><span>{child.title}</span><span aria-hidden="true">›</span></button>)}</div></section>}
       <section className="mobile-chapter-section mobile-chapter-points-section"><div className="mobile-section-heading"><div><h2>知识点</h2><span>{placements.length} 个</span></div><button type="button" className="mobile-inline-link mobile-knowledge-create" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div>{placements.length === 0 ? <p className="mobile-empty">暂无知识点</p> : <div className="mobile-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button type="button" className="mobile-list-row mobile-list-row--point" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span><strong>{point.title}</strong>{chapterPreviews[point.id] && <small className="mobile-point-preview">{chapterPreviews[point.id]}</small>}<small className={`mobile-status-text mobile-status-text--${point.status}`}>{pointStatusLabel(point.status)}</small></span><span aria-hidden="true">›</span></button> : null; })}</div>}</section>
     </div>;
@@ -2134,11 +2344,11 @@ function App() {
       <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={() => selectedChapterId ? selectChapter(selectedChapterId) : mobileGoHome()}>‹ {selectedChapter?.title ?? "悠扬讲义"}</button><div className="mobile-header__actions"><SaveBadge state={saveState} /><button type="button" className="mobile-icon-button" aria-label="知识点更多操作" onClick={() => setMobileSheet("point")}>···</button></div></header>
       {renderMobileMessage()}
       <div className="mobile-point-heading">{viewMode === "edit" ? <input className="mobile-point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /> : <h1>{selectedKnowledgePoint.title}</h1>}<div className="mobile-point-meta"><span className="mobile-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span>{(pointMeta?.tags ?? []).slice(0, 3).map((tag) => <span className="mobile-tag" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length > 3 && <button type="button" className="mobile-inline-link" onClick={() => setTagPickerOpen((value) => !value)}>更多</button>}</div></div>
-      <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
+      <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select>{renderSaveControls(true)}<button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
       {tagPickerOpen && viewMode === "edit" && <div className="mobile-tag-picker"><div className="mobile-tag-options">{tags.map((tag) => <label key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="mobile-tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="mobile-secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="mobile-reference-picker"><div className="mobile-reference-picker__header"><strong>选择目标章节</strong><button type="button" className="mobile-text-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><p>只新增引用，共享核心不复制。</p><div className="mobile-reference-tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
       {organizeMode && selectedPlacement && <div className="mobile-move-panel"><label htmlFor="mobile-point-move">移动当前引用到章节</label><select id="mobile-point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
-      {contentLoading ? <p className="mobile-loading">正在读取知识点内容……</p> : viewMode === "edit" ? <div className="content-edit-stack mobile-content-stack"><div className="content-group-heading"><div><h2>共享核心</h2><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} syncVersion={contentSyncVersion} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>自动保存</span></div><RichTextEditor value={chapterNoteDraft} syncVersion={contentSyncVersion} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack mobile-content-stack">{!hasReadableContent ? <div className="no-content-state"><p>暂无内容，点击“编辑”开始整理。</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h2>共享核心</h2><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
+      {contentLoading ? <p className="mobile-loading">正在读取知识点内容……</p> : viewMode === "edit" ? <div className="content-edit-stack mobile-content-stack"><div className="content-group-heading"><div><h2>共享核心</h2><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} syncVersion={contentSyncVersion} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>手动保存 · 按设置自动保存</span></div><RichTextEditor value={chapterNoteDraft} syncVersion={contentSyncVersion} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack mobile-content-stack">{!hasReadableContent ? <div className="no-content-state"><p>暂无内容，点击“编辑”开始整理。</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h2>共享核心</h2><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
       <nav className="mobile-point-navigation" aria-label="知识点阅读导航"><button type="button" disabled={currentIndex <= 0} onClick={() => navigateKnowledgePoint(-1)}>← {currentIndex > 0 ? pointMap.get(placements[currentIndex - 1]?.knowledge_point_id)?.title ?? "上一篇" : "上一篇"}</button><button type="button" onClick={() => selectedChapterId && selectChapter(selectedChapterId)}>返回目录</button><button type="button" disabled={currentIndex < 0 || currentIndex >= placements.length - 1} onClick={() => navigateKnowledgePoint(1)}>{currentIndex >= 0 && currentIndex < placements.length - 1 ? pointMap.get(placements[currentIndex + 1]?.knowledge_point_id)?.title ?? "下一篇" : "下一篇"} →</button></nav>
     </div>;
   };
@@ -2202,14 +2412,14 @@ function App() {
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}{renderNavigationGuard()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}{renderNavigationGuard()}</section></main>;
 
   if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">悠扬讲义</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button><details className="more-menu page-more-menu"><summary aria-label="全局更多操作">···</summary><div className="more-menu__content"><button type="button" onClick={openDataSecurity}>数据与安全</button></div></details></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {renderOfflineBanner()}{(message || conflictInfo) && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : saveState === "conflict" ? "message-bar--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="text-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
-     <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
+      <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}{renderNavigationGuard()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }

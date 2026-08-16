@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const app = readFileSync(resolve(process.cwd(), "src/main.tsx"), "utf8");
-assert.match(app, /AUTOSAVE_DELAY = 1300/);
+assert.doesNotMatch(app, /AUTOSAVE_DELAY/);
+assert.match(app, /saveAllDirty/);
 assert.match(app, /contentEditSeqRef/);
 assert.match(app, /chapterEditSeqRef/);
 assert.match(app, /chapterNoteEditSeqRef/);

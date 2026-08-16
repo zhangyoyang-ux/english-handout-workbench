@@ -30,7 +30,8 @@ for (const marker of [
   'endpoint("tree")', 'endpoint("chapter"', 'endpoint("knowledge_point"',
   'endpoint("placement"', 'endpoint("chapters"', 'endpoint("knowledge_points"',
   "整理目录", "新建子章节名称", "新建知识点名称", "保存失败", "localStorage",
-  "AUTOSAVE_DELAY = 1300",
+  "AUTOSAVE_INTERVAL_KEY",
+  "saveAllDirty",
 ]) assert.match(app, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 assert.doesNotMatch(app, /图片上传|用户登录|自动备份/);
 

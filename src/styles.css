@@ -76,6 +76,9 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
 .save-badge--conflict .save-badge__dot { background: #c3954c; }
 .large-status-pill { padding: 7px 11px; font-size: 12px; }
 .action-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 28px 0; }
+.save-controls { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.save-controls__interval { display: inline-flex; align-items: center; gap: 4px; color: var(--ui-text-tertiary, #8a8a8f); font-size: 11px; white-space: nowrap; }
+.save-controls__interval select { min-height: 32px; padding: 6px 22px 6px 8px; border: 1px solid var(--ui-border, #dededb); border-radius: 8px; background: #fff; color: var(--ui-text-secondary, #55555a); font-size: 12px; }
 .primary-button, .secondary-button, .quiet-button, .danger-button { padding: 10px 13px; font-size: 13px; font-weight: 700; }
 .primary-button { background: #1c1c1e; color: #fff; }
 .primary-button:hover { background: #3a3a3d; }
@@ -607,7 +610,11 @@ h1 { font-size: clamp(28px, 3.1vw, 40px); letter-spacing: -.045em; }
   .mobile-add-note:hover { color: var(--ui-text); }
   .mobile-textarea { display: block; width: 100%; min-height: 150px; padding: 12px; border: 1px solid var(--ui-border); border-radius: 10px; outline: none; background: var(--ui-surface); color: var(--ui-text); font: inherit; font-size: 15px; line-height: 1.7; resize: vertical; }
   .mobile-textarea:focus, .mobile-point-title-input:focus, .mobile-search-box:focus-within { border-color: #bcbcbf; box-shadow: 0 0 0 3px rgba(32,32,35,.06); }
-  .mobile-edit-actions { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+  .mobile-edit-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+  .mobile-edit-actions .save-controls { flex: 1 1 100%; justify-content: space-between; margin-top: 8px; }
+  .mobile-edit-actions .save-controls__button { min-height: 34px; }
+  .mobile-point-actions .save-controls { flex: 1 1 100%; justify-content: space-between; }
+  .mobile-point-actions .save-controls__button { min-height: 34px; }
   .mobile-point-heading { margin-top: 28px; }
   .mobile-point-heading h1 { margin: 0; color: var(--ui-text); font-size: clamp(25px, 7vw, 32px); font-weight: 700; letter-spacing: -.045em; line-height: 1.2; overflow-wrap: anywhere; }
   .mobile-point-title-input { width: 100%; min-width: 0; padding: 0 0 6px; border: 0; border-bottom: 1px solid var(--ui-border); outline: none; background: transparent; color: var(--ui-text); font: inherit; font-size: clamp(25px, 7vw, 32px); font-weight: 700; letter-spacing: -.045em; line-height: 1.2; }
