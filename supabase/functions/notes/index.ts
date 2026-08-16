@@ -28,6 +28,22 @@ type KnowledgePoint = {
   deleted_at: string | null;
 };
 
+type RichDocument = {
+  type?: unknown;
+  [key: string]: unknown;
+};
+
+type KnowledgePointContent = {
+  id: string;
+  knowledge_point_id: string;
+  explanation: RichDocument;
+  exercises: RichDocument;
+  supplement: RichDocument;
+  inspiration: RichDocument;
+  created_at: string;
+  updated_at: string;
+};
+
 type KnowledgePointPlacement = {
   id: string;
   knowledge_point_id: string;
@@ -56,6 +72,10 @@ type KnowledgePointPayload = {
   status?: unknown;
   chapter_id?: unknown;
   placement_id?: unknown;
+  explanation?: unknown;
+  exercises?: unknown;
+  supplement?: unknown;
+  inspiration?: unknown;
 };
 
 type ReorderPayload = {
@@ -66,8 +86,10 @@ type ReorderPayload = {
 
 const MAX_TITLE_LENGTH = 200;
 const MAX_CONTENT_LENGTH = 200_000;
+const MAX_RICH_DOCUMENT_LENGTH = 500_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUS_VALUES = new Set(["draft", "needs_improvement", "organized"]);
+const CONTENT_FIELDS = ["explanation", "exercises", "supplement", "inspiration"] as const;
 
 const allowedOrigins = new Set([
   "https://zhangyoyang-ux.github.io",
@@ -130,6 +152,16 @@ function isOptionalContent(value: unknown): value is string {
   return typeof value === "string" && value.length <= MAX_CONTENT_LENGTH;
 }
 
+function isRichDocument(value: unknown): value is RichDocument {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  if ((value as RichDocument).type !== "doc") return false;
+  try {
+    return JSON.stringify(value).length <= MAX_RICH_DOCUMENT_LENGTH;
+  } catch {
+    return false;
+  }
+}
+
 function validationError(request: Request, message: string) {
   return json(request, 400, {
     ok: false,
@@ -154,6 +186,12 @@ function databaseError(request: Request, error: unknown, fallback: string) {
       error: { code: "CHAPTER_NOT_FOUND", message: "目标章节不存在或已删除。" },
     });
   }
+  if (message.includes("KNOWLEDGE_POINT_NOT_FOUND")) {
+    return json(request, 404, {
+      ok: false,
+      error: { code: "KNOWLEDGE_POINT_NOT_FOUND", message: "知识点不存在或已删除。" },
+    });
+  }
   if (message.includes("INVALID_CHAPTER_ORDER")) {
     return json(request, 400, {
       ok: false,
@@ -175,6 +213,7 @@ function databaseError(request: Request, error: unknown, fallback: string) {
     KNOWLEDGE_POINT_STATUS_INVALID: "知识点状态无效。",
     KNOWLEDGE_POINT_CREATE_ERROR: "知识点创建失败。",
     PLACEMENT_NOT_FOUND: "知识点位置不存在。",
+    CONTENT_PAYLOAD_INVALID: "知识点内容格式无效。",
   };
   for (const [code, messageText] of Object.entries(validationCodes)) {
     if (message.includes(code)) {
@@ -396,6 +435,61 @@ async function updateKnowledgePoint(client: SupabaseClient, id: string, payload:
   return data as KnowledgePoint;
 }
 
+async function readKnowledgePointContent(client: SupabaseClient, id: string) {
+  if (!isUuid(id)) throw new Error("CONTENT_PAYLOAD_INVALID");
+
+  const { data: point, error: pointError } = await client
+    .from("knowledge_points")
+    .select("id,title,status,created_at,updated_at,deleted_at")
+    .eq("id", id)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (pointError) throw pointError;
+  if (!point) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+
+  const { data: content, error: contentError } = await client
+    .from("knowledge_point_contents")
+    .select("id,knowledge_point_id,explanation,exercises,supplement,inspiration,created_at,updated_at")
+    .eq("knowledge_point_id", id)
+    .maybeSingle();
+  if (contentError) throw contentError;
+
+  return {
+    knowledge_point: point as KnowledgePoint,
+    content: (content as KnowledgePointContent | null) ?? null,
+  };
+}
+
+async function updateKnowledgePointContent(client: SupabaseClient, id: string, payload: KnowledgePointPayload) {
+  if (!isUuid(id)) throw new Error("CONTENT_PAYLOAD_INVALID");
+
+  const { data: point, error: pointError } = await client
+    .from("knowledge_points")
+    .select("id")
+    .eq("id", id)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (pointError) throw pointError;
+  if (!point) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+
+  const values: Record<string, RichDocument> = {};
+  for (const field of CONTENT_FIELDS) {
+    if (payload[field] !== undefined) {
+      if (!isRichDocument(payload[field])) throw new Error("CONTENT_PAYLOAD_INVALID");
+      values[field] = payload[field];
+    }
+  }
+  if (Object.keys(values).length === 0) throw new Error("CONTENT_PAYLOAD_INVALID");
+
+  const { data, error } = await client
+    .from("knowledge_point_contents")
+    .upsert({ knowledge_point_id: id, ...values }, { onConflict: "knowledge_point_id" })
+    .select("id,knowledge_point_id,explanation,exercises,supplement,inspiration,created_at,updated_at")
+    .single();
+  if (error) throw error;
+  return data as KnowledgePointContent;
+}
+
 async function moveKnowledgePoint(client: SupabaseClient, placementId: string, chapterId: string) {
   if (!isUuid(chapterId)) throw new Error("CHAPTER_PARENT_INVALID");
   const chapter = await readChapter(client, chapterId);
@@ -500,6 +594,22 @@ async function handleNote(request: Request, client: SupabaseClient) {
 async function handlePhase2(request: Request, client: SupabaseClient, resource: string) {
   if (request.method === "GET" && resource === "tree") {
     return json(request, 200, { ok: true, ...(await readTree(client)) });
+  }
+
+  if (request.method === "GET" && resource === "content") {
+    const id = new URL(request.url).searchParams.get("id");
+    if (!isUuid(id)) return validationError(request, "知识点内容参数无效。");
+    return json(request, 200, { ok: true, ...(await readKnowledgePointContent(client, id)) });
+  }
+
+  if (request.method === "PATCH" && resource === "content") {
+    const id = new URL(request.url).searchParams.get("id");
+    const payload = await parseBody(request) as KnowledgePointPayload | null;
+    if (!payload || !isUuid(id)) return validationError(request, "知识点内容参数无效。");
+    return json(request, 200, {
+      ok: true,
+      content: await updateKnowledgePointContent(client, id, payload),
+    });
   }
 
   if (request.method === "POST" && resource === "chapter") {

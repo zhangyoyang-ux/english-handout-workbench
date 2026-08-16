@@ -7,10 +7,12 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "lint": "eslint .",
-    "test": "node tests/phase1-smoke.mjs && node tests/phase2-smoke.mjs"
+    "test": "node tests/phase1-smoke.mjs && node tests/phase2-smoke.mjs && node tests/phase3-smoke.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.54.0",
+    "@tiptap/react": "^3.30.1",
+    "@tiptap/starter-kit": "^3.30.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
