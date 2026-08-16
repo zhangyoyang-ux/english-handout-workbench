@@ -6,7 +6,7 @@ import { createRoot } from "react-dom/client";
 import type { ExportContentInput, ExportSelection, ExportTreeInput } from "./wordExport";
 import "./styles.css";
 
-type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
+type SaveState = "idle" | "dirty" | "saving" | "saved" | "error" | "conflict";
 type PointStatus = "draft" | "needs_improvement" | "organized";
 type ContentSection = "explanation" | "exercises" | "supplement" | "inspiration";
 type RichDocument = JSONContent;
@@ -17,6 +17,7 @@ type Chapter = {
   parent_id: string | null;
   sort_order: number;
   content: string;
+  overview_revision: number;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -26,6 +27,7 @@ type KnowledgePoint = {
   id: string;
   title: string;
   status: PointStatus;
+  core_revision: number;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
@@ -37,6 +39,7 @@ type Placement = {
   chapter_id: string;
   sort_order: number;
   chapter_note: RichDocument;
+  note_revision: number;
   created_at: string;
   deleted_at: string | null;
 };
@@ -66,6 +69,17 @@ type ApiErrorPayload = {
   child_count?: number;
   knowledge_point_count?: number;
   placement_count?: number;
+  entity?: string;
+  current_revision?: number;
+  updated_at?: string | null;
+};
+
+type ConflictInfo = {
+  entity: "knowledge_point_core" | "placement_note" | "chapter_overview";
+  entityId: string;
+  baseRevision: number;
+  currentRevision: number;
+  updatedAt: string | null;
 };
 
 type ApiResponse = {
@@ -353,7 +367,7 @@ function readExpandedIds() {
     return new Set<string>(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : []);
   } catch { return new Set<string>(); }
 }
-function saveStateLabel(state: SaveState) { return { idle: "等待编辑", dirty: "待保存", saving: "保存中", saved: "已保存", error: "保存失败" }[state]; }
+function saveStateLabel(state: SaveState) { return { idle: "等待编辑", dirty: "待保存", saving: "保存中", saved: "已保存", error: "保存失败", conflict: "有更新冲突" }[state]; }
 function pointStatusLabel(status: PointStatus) { return POINT_STATUS_LABELS[status]; }
 function matchTypeLabel(type: string) { return ({ title: "标题命中", explanation: "知识讲解命中", exercises: "例题命中", supplement: "补充内容命中", inspiration: "灵感命中", chapter_note: "本章补充命中", tag: "标签命中" } as Record<string, string>)[type] ?? type; }
 function sortByOrder<T extends { sort_order: number; created_at: string }>(items: T[]) { return [...items].sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at)); }
@@ -426,8 +440,14 @@ function App() {
   const [contentDraft, setContentDraft] = useState<ContentDraft>(emptyContentDraft);
   const [chapterPreviews, setChapterPreviews] = useState<Record<string, string>>({});
   const [contentDirty, setContentDirty] = useState(false);
+  const [chapterDirty, setChapterDirty] = useState(false);
   const [chapterNoteDraft, setChapterNoteDraft] = useState<RichDocument>(emptyDocument);
   const [chapterNoteDirty, setChapterNoteDirty] = useState(false);
+  const [coreSavePaused, setCoreSavePaused] = useState(false);
+  const [noteSavePaused, setNoteSavePaused] = useState(false);
+  const [chapterSavePaused, setChapterSavePaused] = useState(false);
+  const [conflictInfo, setConflictInfo] = useState<ConflictInfo | null>(null);
+  const [conflictModalOpen, setConflictModalOpen] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [showReferencePicker, setShowReferencePicker] = useState(false);
   const [pickerExpandedIds, setPickerExpandedIds] = useState<Set<string>>(new Set());
@@ -480,8 +500,26 @@ function App() {
   const [lastFullBackupAt, setLastFullBackupAt] = useState(() => localStorage.getItem(LAST_FULL_BACKUP_KEY) ?? "");
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
+  const pendingCoreMetadataRef = useRef<Partial<Pick<KnowledgePoint, "title" | "status">>>({});
   const contentVersionRef = useRef(0);
   const contentRequestRef = useRef(0);
+  const contentDraftRef = useRef<ContentDraft>(emptyContentDraft());
+  const contentDirtyRef = useRef(false);
+  const chapterNoteDraftRef = useRef<RichDocument>(emptyDocument());
+  const chapterNoteDirtyRef = useRef(false);
+  const contentSaveInFlightRef = useRef(false);
+  const contentSaveQueuedRef = useRef(false);
+  const coreRevisionRef = useRef<number | null>(null);
+  const titleDraftRef = useRef("");
+  const pointStatusDraftRef = useRef<PointStatus | null>(null);
+  const chapterContentRef = useRef("");
+  const chapterDirtyRef = useRef(false);
+  const chapterSaveInFlightRef = useRef(false);
+  const chapterSaveQueuedRef = useRef(false);
+  const overviewRevisionRef = useRef<number | null>(null);
+  const noteSaveInFlightRef = useRef(false);
+  const noteSaveQueuedRef = useRef(false);
+  const noteRevisionRef = useRef<number | null>(null);
   const noteContextRef = useRef<string | null>(null);
   const pointEditSessionRef = useRef<{ key: string; snapshot: HistorySnapshot; captured: boolean } | null>(null);
   const placementEditSessionRef = useRef<{ key: string; snapshot: RichDocument; captured: boolean } | null>(null);
@@ -520,7 +558,7 @@ function App() {
 
   const exportIsReady = () => {
     if (exportBusy) return false;
-    if (saveState === "saving" || saveState === "dirty" || saveState === "error" || contentDirty || chapterNoteDirty) {
+    if (saveState === "saving" || saveState === "dirty" || saveState === "error" || saveState === "conflict" || contentDirty || chapterDirty || chapterNoteDirty) {
       setMessage("当前修改尚未成功保存，请先完成保存后再导出。");
       return false;
     }
@@ -672,11 +710,19 @@ function App() {
 
   const refreshPointContent = useCallback(async (pointId: string) => {
     const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
+    const draft = contentDraftFromRecord(result.content);
+    coreRevisionRef.current = result.knowledge_point.core_revision;
+    contentDraftRef.current = draft;
+    contentDirtyRef.current = false;
+    pendingCoreMetadataRef.current = {};
+    pendingContentFieldsRef.current.clear();
+    titleDraftRef.current = result.knowledge_point.title;
+    pointStatusDraftRef.current = result.knowledge_point.status;
+    setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === pointId ? result.knowledge_point : point) }));
     setContentRecord(result.content);
-    setContentDraft(contentDraftFromRecord(result.content));
+    setContentDraft(draft);
     setTitleDraft(result.knowledge_point.title);
     setContentDirty(false);
-    pendingContentFieldsRef.current.clear();
   }, []);
 
   const loadHistory = useCallback(async (kind: HistoryKind, id: string) => {
@@ -778,6 +824,325 @@ function App() {
     void restoreRecycleItem(item);
   };
 
+  const conflictDraftKey = (info: ConflictInfo) => info.entity === "knowledge_point_core"
+    ? `${CONTENT_DRAFT_PREFIX}${info.entityId}`
+    : info.entity === "placement_note"
+      ? `${CHAPTER_NOTE_DRAFT_PREFIX}${info.entityId}`
+      : `english-handout-workbench:phase2:chapter:${info.entityId}`;
+
+  const persistConflictDraft = useCallback((info: ConflictInfo, draft: unknown) => {
+    try {
+      window.localStorage.setItem(conflictDraftKey(info), JSON.stringify({
+        entity_id: info.entityId,
+        entity_type: info.entity,
+        base_revision: info.baseRevision,
+        cloud_revision: info.currentRevision,
+        saved_at: new Date().toISOString(),
+        draft,
+      }));
+    } catch { /* Local draft protection is best effort; cloud remains authoritative. */ }
+  }, []);
+
+  const openEditConflict = useCallback((info: ConflictInfo, draft: unknown) => {
+    persistConflictDraft(info, draft);
+    setConflictInfo(info);
+    setConflictModalOpen(true);
+    setSaveState("conflict");
+    setMessage("检测到内容更新冲突。当前输入已保留在本机草稿中。");
+  }, [persistConflictDraft]);
+
+  const flushChapterSave = useCallback(async (chapterId: string) => {
+    if (chapterSaveInFlightRef.current) {
+      chapterSaveQueuedRef.current = true;
+      return;
+    }
+    if (chapterId !== selectedChapterId || !chapterDirtyRef.current || chapterSavePaused || overviewRevisionRef.current === null) return;
+    const contentAtStart = chapterContentRef.current;
+    const baseRevision = overviewRevisionRef.current;
+    const conflictBase: ConflictInfo = { entity: "chapter_overview", entityId: chapterId, baseRevision, currentRevision: baseRevision, updatedAt: null };
+    let conflicted = false;
+    chapterSaveInFlightRef.current = true;
+    setSaveState("saving");
+    setMessage("");
+    try {
+      const result = await requestJson<{ ok: true; chapter: Chapter }>(endpoint("chapter", { id: chapterId }), {
+        method: "PATCH",
+        body: JSON.stringify({ content: contentAtStart, expected_revision: baseRevision }),
+      });
+      if (chapterId !== selectedChapterId) return;
+      overviewRevisionRef.current = result.chapter.overview_revision;
+      setTree((previous) => ({
+        ...previous,
+        chapters: previous.chapters.map((chapter) => chapter.id === chapterId ? result.chapter : chapter),
+      }));
+      if (chapterContentRef.current === contentAtStart) {
+        chapterDirtyRef.current = false;
+        setChapterDirty(false);
+        try { window.localStorage.removeItem(`english-handout-workbench:phase2:chapter:${chapterId}`); } catch { /* Best effort. */ }
+      } else {
+        chapterSaveQueuedRef.current = true;
+      }
+      setSaveState(contentDirtyRef.current || chapterNoteDirtyRef.current || chapterDirtyRef.current ? "dirty" : "saved");
+      setMessage("章节内容已保存到 Supabase PostgreSQL。");
+      refreshFastAccess();
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
+        conflicted = true;
+        const details = error.details ?? {};
+        const info = { ...conflictBase, currentRevision: details.current_revision ?? baseRevision + 1, updatedAt: details.updated_at ?? null };
+        setChapterSavePaused(true);
+        openEditConflict(info, { content: chapterContentRef.current });
+      } else {
+        setSaveState("error");
+        setMessage(`保存失败，章节内容已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`);
+      }
+    } finally {
+      chapterSaveInFlightRef.current = false;
+      if (!conflicted && !chapterSavePaused && (chapterSaveQueuedRef.current || chapterDirtyRef.current)) {
+        chapterSaveQueuedRef.current = false;
+        window.setTimeout(() => { void flushChapterSave(chapterId); }, AUTOSAVE_DELAY);
+      }
+    }
+  }, [chapterSavePaused, contentDirtyRef, openEditConflict, refreshFastAccess, selectedChapterId]);
+
+  const flushContentSave = useCallback(async (pointId: string) => {
+    if (contentSaveInFlightRef.current) {
+      contentSaveQueuedRef.current = true;
+      return;
+    }
+    const hasMetadataPatch = Object.keys(pendingCoreMetadataRef.current).length > 0;
+    if (pointId !== selectedKnowledgePointId || (!contentDirtyRef.current && !hasMetadataPatch) || (pendingContentFieldsRef.current.size === 0 && !hasMetadataPatch) || coreSavePaused || coreRevisionRef.current === null) return;
+    const fieldsAtStart = [...pendingContentFieldsRef.current];
+    const metadataAtStart = { ...pendingCoreMetadataRef.current };
+    const payload: Partial<Pick<KnowledgePoint, "title" | "status">> & Partial<ContentDraft> = { ...metadataAtStart };
+    for (const field of fieldsAtStart) payload[field] = contentDraftRef.current[field];
+    const baseRevision = coreRevisionRef.current;
+    const conflictBase: ConflictInfo = { entity: "knowledge_point_core", entityId: pointId, baseRevision, currentRevision: baseRevision, updatedAt: null };
+    let conflicted = false;
+    contentSaveInFlightRef.current = true;
+    setSaveState("saving");
+    setMessage("");
+    try {
+      const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent }>(endpoint("content", { id: pointId }), {
+        method: "PATCH",
+        body: JSON.stringify({ ...payload, expected_revision: baseRevision }),
+      });
+      if (pointId !== selectedKnowledgePointId) return;
+      coreRevisionRef.current = result.knowledge_point.core_revision;
+      setTree((previous) => ({
+        ...previous,
+        knowledge_points: previous.knowledge_points.map((point) => point.id === pointId ? result.knowledge_point : point),
+      }));
+      setContentRecord(result.content);
+      for (const field of fieldsAtStart) {
+        const savedValue = payload[field];
+        if (savedValue !== undefined && documentsEqual(contentDraftRef.current[field], savedValue)) pendingContentFieldsRef.current.delete(field);
+      }
+      if (metadataAtStart.title !== undefined && titleDraftRef.current === metadataAtStart.title) delete pendingCoreMetadataRef.current.title;
+      if (metadataAtStart.status !== undefined && pointStatusDraftRef.current === metadataAtStart.status) delete pendingCoreMetadataRef.current.status;
+      const stillDirty = pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0;
+      contentDirtyRef.current = stillDirty;
+      setContentDirty(stillDirty);
+      if (!stillDirty) {
+        try { window.localStorage.removeItem(`${CONTENT_DRAFT_PREFIX}${pointId}`); } catch { /* Best effort. */ }
+      } else {
+        contentSaveQueuedRef.current = true;
+      }
+      setSaveState(stillDirty || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
+      setMessage("共享核心已保存到 Supabase PostgreSQL。");
+      refreshFastAccess();
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
+        conflicted = true;
+        const details = error.details ?? {};
+        const info = { ...conflictBase, currentRevision: details.current_revision ?? baseRevision + 1, updatedAt: details.updated_at ?? null };
+        setCoreSavePaused(true);
+        openEditConflict(info, { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: contentDraftRef.current });
+      } else {
+        setSaveState("error");
+        setMessage(`保存失败，当前输入已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`);
+      }
+    } finally {
+      contentSaveInFlightRef.current = false;
+      if (!conflicted && !coreSavePaused && (contentSaveQueuedRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0)) {
+        contentSaveQueuedRef.current = false;
+        window.setTimeout(() => { void flushContentSave(pointId); }, AUTOSAVE_DELAY);
+      }
+    }
+  }, [coreSavePaused, openEditConflict, refreshFastAccess, selectedKnowledgePointId]);
+
+  const flushNoteSave = useCallback(async (placementId: string) => {
+    if (noteSaveInFlightRef.current) {
+      noteSaveQueuedRef.current = true;
+      return;
+    }
+    if (placementId !== selectedPlacementId || !chapterNoteDirtyRef.current || noteSavePaused || noteRevisionRef.current === null) return;
+    const noteAtStart = chapterNoteDraftRef.current;
+    const baseRevision = noteRevisionRef.current;
+    const conflictBase: ConflictInfo = { entity: "placement_note", entityId: placementId, baseRevision, currentRevision: baseRevision, updatedAt: null };
+    let conflicted = false;
+    noteSaveInFlightRef.current = true;
+    setSaveState("saving");
+    setMessage("");
+    try {
+      const result = await requestJson<{ ok: true; placement: Placement }>(endpoint("placement", { id: placementId }), {
+        method: "PATCH",
+        body: JSON.stringify({ chapter_note: noteAtStart, expected_revision: baseRevision }),
+      });
+      if (placementId !== selectedPlacementId) return;
+      noteRevisionRef.current = result.placement.note_revision;
+      setTree((previous) => ({
+        ...previous,
+        knowledge_point_placements: previous.knowledge_point_placements.map((placement) => placement.id === placementId ? result.placement : placement),
+      }));
+      if (documentsEqual(chapterNoteDraftRef.current, noteAtStart)) {
+        chapterNoteDirtyRef.current = false;
+        setChapterNoteDirty(false);
+        try { window.localStorage.removeItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${placementId}`); } catch { /* Best effort. */ }
+      } else {
+        noteSaveQueuedRef.current = true;
+      }
+      setSaveState(contentDirtyRef.current || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
+      setMessage("本章补充已保存到 Supabase PostgreSQL。");
+      refreshFastAccess();
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
+        conflicted = true;
+        const details = error.details ?? {};
+        const info = { ...conflictBase, currentRevision: details.current_revision ?? baseRevision + 1, updatedAt: details.updated_at ?? null };
+        setNoteSavePaused(true);
+        openEditConflict(info, { value: chapterNoteDraftRef.current });
+      } else {
+        setSaveState("error");
+        setMessage(`保存失败，本章补充已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`);
+      }
+    } finally {
+      noteSaveInFlightRef.current = false;
+      if (!conflicted && !noteSavePaused && (noteSaveQueuedRef.current || chapterNoteDirtyRef.current)) {
+        noteSaveQueuedRef.current = false;
+        window.setTimeout(() => { void flushNoteSave(placementId); }, AUTOSAVE_DELAY);
+      }
+    }
+  }, [contentDirtyRef, chapterDirtyRef, noteSavePaused, openEditConflict, refreshFastAccess, selectedPlacementId]);
+
+  const applyFreshPointResult = useCallback((result: { knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }) => {
+    const draft = contentDraftFromRecord(result.content);
+    coreRevisionRef.current = result.knowledge_point.core_revision;
+    contentDraftRef.current = draft;
+    contentDirtyRef.current = false;
+    pendingCoreMetadataRef.current = {};
+    pendingContentFieldsRef.current.clear();
+    titleDraftRef.current = result.knowledge_point.title;
+    pointStatusDraftRef.current = result.knowledge_point.status;
+    setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === result.knowledge_point.id ? result.knowledge_point : point) }));
+    setContentRecord(result.content);
+    setContentDraft(draft);
+    setContentDirty(false);
+    setTitleDraft(result.knowledge_point.title);
+    setCoreSavePaused(false);
+  }, []);
+
+  const applyFreshPlacementResult = useCallback((placement: Placement) => {
+    setTree((previous) => ({
+      ...previous,
+      knowledge_point_placements: previous.knowledge_point_placements.map((item) => item.id === placement.id ? placement : item),
+    }));
+    if (placement.id !== selectedPlacementId) return;
+    noteRevisionRef.current = placement.note_revision;
+    const nextNote = normaliseDocument(placement.chapter_note);
+    chapterNoteDraftRef.current = nextNote;
+    chapterNoteDirtyRef.current = false;
+    setChapterNoteDraft(nextNote);
+    setChapterNoteDirty(false);
+    setNoteSavePaused(false);
+  }, [selectedPlacementId]);
+
+  const loadLatestConflict = useCallback(async () => {
+    const info = conflictInfo;
+    if (!info) return;
+    try {
+      if (info.entity === "knowledge_point_core") {
+        const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: info.entityId }));
+        if (selectedKnowledgePointId === info.entityId) applyFreshPointResult(result);
+      } else if (info.entity === "placement_note") {
+        const result = await requestJson<{ ok: true; placements: Placement[] }>(endpoint("placements", { id: selectedKnowledgePointId ?? "" }));
+        const placement = result.placements?.find((item) => item.id === info.entityId);
+        if (!placement) throw new Error("这个引用位置已经不存在或已移入回收站。");
+        applyFreshPlacementResult(placement);
+      } else {
+        const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+        const freshTree = { chapters: result.chapters ?? [], knowledge_points: result.knowledge_points ?? [], knowledge_point_placements: result.knowledge_point_placements ?? [] };
+        const chapter = freshTree.chapters.find((item) => item.id === info.entityId);
+        if (!chapter) throw new Error("这个章节已经不存在或已移入回收站。");
+        setTree(freshTree);
+        if (selectedChapterId === info.entityId) {
+          overviewRevisionRef.current = chapter.overview_revision;
+          chapterContentRef.current = chapter.content;
+          chapterDirtyRef.current = false;
+          setChapterDirty(false);
+          setChapterSavePaused(false);
+        }
+      }
+      setConflictModalOpen(false);
+      setConflictInfo(null);
+      setSaveState("saved");
+      setMessage("已加载云端最新版本。刚才未保存的修改仍保存在本机草稿中。");
+    } catch (error) {
+      setMessage(error instanceof Error ? `云端最新版本读取失败：${error.message}` : "云端最新版本读取失败，请稍后重试。");
+    }
+  }, [applyFreshPlacementResult, applyFreshPointResult, conflictInfo, selectedChapterId, selectedKnowledgePointId]);
+
+  const revalidateSelectedEntity = useCallback(async () => {
+    if (selectedKnowledgePointId) {
+      const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: selectedKnowledgePointId }));
+      if (coreRevisionRef.current !== null && result.knowledge_point.core_revision !== coreRevisionRef.current) {
+        if (contentDirtyRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0) {
+          openEditConflict({ entity: "knowledge_point_core", entityId: selectedKnowledgePointId, baseRevision: coreRevisionRef.current, currentRevision: result.knowledge_point.core_revision, updatedAt: result.knowledge_point.updated_at }, { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: contentDraftRef.current });
+          return;
+        }
+        applyFreshPointResult(result);
+      }
+
+      if (selectedPlacementId) {
+        const placementsResult = await requestJson<{ ok: true; placements: Placement[] }>(endpoint("placements", { id: selectedKnowledgePointId }));
+        const freshPlacement = placementsResult.placements?.find((item) => item.id === selectedPlacementId);
+        if (freshPlacement && noteRevisionRef.current !== null && freshPlacement.note_revision !== noteRevisionRef.current) {
+          if (chapterNoteDirtyRef.current) {
+            openEditConflict({ entity: "placement_note", entityId: selectedPlacementId, baseRevision: noteRevisionRef.current, currentRevision: freshPlacement.note_revision, updatedAt: null }, { value: chapterNoteDraftRef.current });
+            return;
+          }
+          applyFreshPlacementResult(freshPlacement);
+        }
+      }
+      return;
+    }
+
+    if (!selectedChapterId) return;
+    const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+    const freshChapter = (result.chapters ?? []).find((chapter) => chapter.id === selectedChapterId);
+    if (!freshChapter || overviewRevisionRef.current === null || freshChapter.overview_revision === overviewRevisionRef.current) return;
+    if (chapterDirtyRef.current) {
+      openEditConflict({ entity: "chapter_overview", entityId: selectedChapterId, baseRevision: overviewRevisionRef.current, currentRevision: freshChapter.overview_revision, updatedAt: freshChapter.updated_at }, { content: chapterContentRef.current });
+      return;
+    }
+    setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === freshChapter.id ? freshChapter : chapter) }));
+    overviewRevisionRef.current = freshChapter.overview_revision;
+    chapterContentRef.current = freshChapter.content;
+  }, [applyFreshPlacementResult, applyFreshPointResult, openEditConflict, selectedChapterId, selectedKnowledgePointId, selectedPlacementId]);
+
+  useEffect(() => {
+    const revalidate = () => {
+      if (document.visibilityState !== "visible") return;
+      void revalidateSelectedEntity().catch(() => { /* A focus check must not interrupt reading. */ });
+    };
+    window.addEventListener("focus", revalidate);
+    document.addEventListener("visibilitychange", revalidate);
+    return () => {
+      window.removeEventListener("focus", revalidate);
+      document.removeEventListener("visibilitychange", revalidate);
+    };
+  }, [revalidateSelectedEntity]);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -825,30 +1190,50 @@ function App() {
 
   useEffect(() => {
     if (!selectedChapter || selectedKnowledgePointId) return;
-    if (loadedChapterIdRef.current !== selectedChapter.id) { loadedChapterIdRef.current = selectedChapter.id; setSaveState("saved"); return; }
+    chapterContentRef.current = selectedChapter.content;
+    if (loadedChapterIdRef.current !== selectedChapter.id) {
+      loadedChapterIdRef.current = selectedChapter.id;
+      overviewRevisionRef.current = selectedChapter.overview_revision;
+      chapterDirtyRef.current = false;
+      setChapterDirty(false);
+      setChapterSavePaused(false);
+      setSaveState("saved");
+      return;
+    }
+    if (!chapterDirtyRef.current || chapterSavePaused) return;
     const draftKey = `english-handout-workbench:phase2:chapter:${selectedChapter.id}`;
-    try { window.localStorage.setItem(draftKey, JSON.stringify({ content: selectedChapter.content, savedAt: new Date().toISOString() })); } catch { /* Cloud remains the source of truth. */ }
-    const timer = window.setTimeout(async () => {
-      setSaveState("saving"); setMessage("");
-      try {
-        await requestJson(endpoint("chapter", { id: selectedChapter.id }), { method: "PATCH", body: JSON.stringify({ content: selectedChapter.content }) });
-        setSaveState("saved"); setMessage("章节内容已保存到 Supabase PostgreSQL。"); refreshFastAccess();
-        try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
-      } catch (error) { setSaveState("error"); setMessage(`保存失败，章节内容已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`); }
-    }, AUTOSAVE_DELAY);
+    try { window.localStorage.setItem(draftKey, JSON.stringify({ content: chapterContentRef.current, savedAt: new Date().toISOString(), base_revision: overviewRevisionRef.current })); } catch { /* Cloud remains the source of truth. */ }
+    const timer = window.setTimeout(() => { void flushChapterSave(selectedChapter.id); }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [selectedChapter, selectedKnowledgePointId, refreshFastAccess]);
+  }, [chapterSavePaused, flushChapterSave, selectedChapter, selectedKnowledgePointId]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
     pointEditSessionRef.current = null;
     if (!pointId) {
+      coreRevisionRef.current = null;
+      contentDraftRef.current = emptyContentDraft();
+      contentDirtyRef.current = false;
+      pendingCoreMetadataRef.current = {};
+      titleDraftRef.current = "";
+      pointStatusDraftRef.current = null;
+      setCoreSavePaused(false);
       setContentRecord(null); setContentDraft(emptyContentDraft()); setContentDirty(false); setTitleDraft(""); pendingContentFieldsRef.current.clear(); return;
     }
     const requestId = ++contentRequestRef.current;
-    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(""); setSaveState("saved"); setMessage("");
+    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); pendingCoreMetadataRef.current = {}; coreRevisionRef.current = null; contentDraftRef.current = emptyContentDraft(); contentDirtyRef.current = false; titleDraftRef.current = ""; pointStatusDraftRef.current = null; setCoreSavePaused(false); setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(""); setSaveState("saved"); setMessage("");
     void requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }))
-      .then((result) => { if (requestId !== contentRequestRef.current) return; setContentRecord(result.content); setContentDraft(contentDraftFromRecord(result.content)); setTitleDraft(result.knowledge_point.title); })
+      .then((result) => {
+        if (requestId !== contentRequestRef.current) return;
+        const draft = contentDraftFromRecord(result.content);
+        coreRevisionRef.current = result.knowledge_point.core_revision;
+        contentDraftRef.current = draft;
+        contentDirtyRef.current = false;
+        titleDraftRef.current = result.knowledge_point.title;
+        pointStatusDraftRef.current = result.knowledge_point.status;
+        setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === result.knowledge_point.id ? result.knowledge_point : point) }));
+        setContentRecord(result.content); setContentDraft(draft); setContentDirty(false); setTitleDraft(result.knowledge_point.title);
+      })
       .catch((error) => { if (requestId !== contentRequestRef.current) return; setSaveState("error"); setMessage(`知识点内容读取失败：${error instanceof Error ? error.message : "网络连接异常。"}`); })
       .finally(() => { if (requestId === contentRequestRef.current) setContentLoading(false); });
   }, [selectedKnowledgePointId]);
@@ -891,59 +1276,37 @@ function App() {
     noteContextRef.current = selectedPlacementId;
     placementEditSessionRef.current = null;
     if (!selectedPlacementId) {
+      noteRevisionRef.current = null;
+      chapterNoteDraftRef.current = emptyDocument();
+      chapterNoteDirtyRef.current = false;
+      setNoteSavePaused(false);
       setChapterNoteDraft(emptyDocument());
       setChapterNoteDirty(false);
       return;
     }
-    setChapterNoteDraft(normaliseDocument(selectedPlacementNote));
+    noteRevisionRef.current = selectedPlacement?.note_revision ?? null;
+    const nextNote = normaliseDocument(selectedPlacementNote);
+    chapterNoteDraftRef.current = nextNote;
+    chapterNoteDirtyRef.current = false;
+    setNoteSavePaused(false);
+    setChapterNoteDraft(nextNote);
     setChapterNoteDirty(false);
-  }, [selectedPlacementId, selectedPlacementNote]);
+  }, [selectedPlacement, selectedPlacementId, selectedPlacementNote]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
-    if (!pointId || !contentDirty || pendingContentFieldsRef.current.size === 0) return;
-    const versionAtSchedule = contentVersionRef.current; const fieldsAtSchedule = [...pendingContentFieldsRef.current]; const payload = Object.fromEntries(fieldsAtSchedule.map((field) => [field, contentDraft[field]])); const draftKey = `${CONTENT_DRAFT_PREFIX}${pointId}`;
-    const timer = window.setTimeout(() => {
-      setSaveState("saving"); setMessage("");
-      void requestJson<{ ok: true; content: KnowledgePointContent }>(endpoint("content", { id: pointId }), { method: "PATCH", body: JSON.stringify(payload) }).then((result) => {
-        if (pointId !== selectedKnowledgePointId || versionAtSchedule !== contentVersionRef.current) return;
-        setContentRecord(result.content); pendingContentFieldsRef.current.clear(); setContentDirty(false); setSaveState(chapterNoteDirty ? "dirty" : "saved"); setMessage("共享核心已保存到 Supabase PostgreSQL。"); refreshFastAccess();
-        try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
-      }).catch((error) => { if (pointId === selectedKnowledgePointId) { setSaveState("error"); setMessage(`保存失败，当前输入已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`); } });
-    }, AUTOSAVE_DELAY);
+    const hasMetadataPatch = Object.keys(pendingCoreMetadataRef.current).length > 0;
+    if (!pointId || (!contentDirty && !hasMetadataPatch) || (pendingContentFieldsRef.current.size === 0 && !hasMetadataPatch) || coreSavePaused) return;
+    const timer = window.setTimeout(() => { void flushContentSave(pointId); }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [contentDraft, contentDirty, selectedKnowledgePointId, chapterNoteDirty, refreshFastAccess]);
+  }, [contentDirty, coreSavePaused, flushContentSave, selectedKnowledgePointId]);
 
   useEffect(() => {
     const placementId = selectedPlacementId;
-    if (!placementId || !chapterNoteDirty) return;
-    const draftKey = `${CHAPTER_NOTE_DRAFT_PREFIX}${placementId}`;
-    const noteAtSchedule = chapterNoteDraft;
-    const timer = window.setTimeout(() => {
-      setSaveState("saving");
-      setMessage("");
-      void requestJson<{ ok: true; placement: Placement }>(endpoint("placement", { id: placementId }), {
-        method: "PATCH",
-        body: JSON.stringify({ chapter_note: noteAtSchedule }),
-      }).then((result) => {
-        if (selectedPlacementId !== placementId) return;
-        setTree((previous) => ({
-          ...previous,
-          knowledge_point_placements: previous.knowledge_point_placements.map((placement) => placement.id === placementId ? result.placement : placement),
-        }));
-        setChapterNoteDirty(false);
-        setSaveState(contentDirty ? "dirty" : "saved");
-        setMessage("本章补充已保存到 Supabase PostgreSQL。");
-        refreshFastAccess();
-        try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
-      }).catch((error) => {
-        if (selectedPlacementId !== placementId) return;
-        setSaveState("error");
-        setMessage(`保存失败，当前本章补充已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`);
-      });
-    }, AUTOSAVE_DELAY);
+    if (!placementId || !chapterNoteDirty || noteSavePaused) return;
+    const timer = window.setTimeout(() => { void flushNoteSave(placementId); }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [chapterNoteDraft, chapterNoteDirty, selectedPlacementId, contentDirty, refreshFastAccess]);
+  }, [chapterNoteDirty, flushNoteSave, noteSavePaused, selectedPlacementId]);
 
   const childrenOf = (parentId: string | null) => sortByOrder(tree.chapters.filter((chapter) => chapter.parent_id === parentId));
   const placementsOf = (chapterId: string) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.chapter_id === chapterId));
@@ -1091,9 +1454,51 @@ function App() {
   };
   const beginPointEdit = () => {
     if (!selectedKnowledgePoint) return;
-    ensurePointEditSession();
-    setTitleDraft(selectedKnowledgePoint.title);
-    setViewMode("edit");
+    void (async () => {
+      try {
+        const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: selectedKnowledgePoint.id }));
+        if (coreRevisionRef.current !== null && result.knowledge_point.core_revision !== coreRevisionRef.current && (contentDirtyRef.current || pendingContentFieldsRef.current.size > 0 || Object.keys(pendingCoreMetadataRef.current).length > 0)) {
+          openEditConflict({ entity: "knowledge_point_core", entityId: selectedKnowledgePoint.id, baseRevision: coreRevisionRef.current, currentRevision: result.knowledge_point.core_revision, updatedAt: result.knowledge_point.updated_at }, { title: titleDraftRef.current || selectedKnowledgePoint.title, status: pointStatusDraftRef.current ?? selectedKnowledgePoint.status, content: contentDraftRef.current });
+          return;
+        }
+        if (coreRevisionRef.current === null || result.knowledge_point.core_revision !== coreRevisionRef.current) applyFreshPointResult(result);
+        const currentPoint = result.knowledge_point;
+        titleDraftRef.current = currentPoint.title;
+        pointStatusDraftRef.current = currentPoint.status;
+        pointEditSessionRef.current = {
+          key: currentPoint.id,
+          snapshot: JSON.parse(JSON.stringify({ title: currentPoint.title, status: currentPoint.status, content: contentDraftRef.current })) as HistorySnapshot,
+          captured: false,
+        };
+        setTitleDraft(currentPoint.title);
+        setViewMode("edit");
+      } catch (error) {
+        setMessage(error instanceof Error ? `进入编辑前读取最新内容失败：${error.message}` : "进入编辑前读取最新内容失败。");
+      }
+    })();
+  };
+  const beginChapterEdit = () => {
+    if (!selectedChapter) return;
+    void (async () => {
+      try {
+        const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+        const freshChapter = (result.chapters ?? []).find((chapter) => chapter.id === selectedChapter.id);
+        if (!freshChapter) throw new Error("章节不存在或已移入回收站。");
+        if (overviewRevisionRef.current !== null && freshChapter.overview_revision !== overviewRevisionRef.current && chapterDirtyRef.current) {
+          openEditConflict({ entity: "chapter_overview", entityId: freshChapter.id, baseRevision: overviewRevisionRef.current, currentRevision: freshChapter.overview_revision, updatedAt: freshChapter.updated_at }, { content: chapterContentRef.current });
+          return;
+        }
+        setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === freshChapter.id ? freshChapter : chapter) }));
+        overviewRevisionRef.current = freshChapter.overview_revision;
+        chapterContentRef.current = freshChapter.content;
+        chapterDirtyRef.current = false;
+        setChapterDirty(false);
+        setChapterSavePaused(false);
+        setChapterEditMode(true);
+      } catch (error) {
+        setMessage(error instanceof Error ? `进入编辑前读取最新章节失败：${error.message}` : "进入编辑前读取最新章节失败。");
+      }
+    })();
   };
   const capturePointHistory = () => {
     ensurePointEditSession();
@@ -1111,11 +1516,26 @@ function App() {
       .catch((error) => setMessage(`本章补充历史快照保存失败，正文仍会继续保存：${error instanceof Error ? error.message : "网络连接异常。"}`));
   };
 
-  const updateChapterContent = (content: string) => { if (!selectedChapterId) return; setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === selectedChapterId ? { ...chapter, content } : chapter) })); setSaveState("dirty"); };
+  const updateChapterContent = (content: string) => {
+    if (!selectedChapterId) return;
+    chapterContentRef.current = content;
+    chapterDirtyRef.current = true;
+    setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === selectedChapterId ? { ...chapter, content } : chapter) }));
+    setChapterDirty(true);
+    setSaveState("dirty");
+    try { window.localStorage.setItem(`english-handout-workbench:phase2:chapter:${selectedChapterId}`, JSON.stringify({ content, savedAt: new Date().toISOString(), base_revision: overviewRevisionRef.current })); } catch { /* Temporary protection is best effort. */ }
+  };
   const updateContentSection = (section: ContentSection, value: RichDocument) => {
     capturePointHistory();
-    setContentDraft((previous) => ({ ...previous, [section]: value })); pendingContentFieldsRef.current.add(section); contentVersionRef.current += 1; setContentDirty(true); setSaveState("dirty");
-    try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePointId}`, JSON.stringify({ ...contentDraft, [section]: value, savedAt: new Date().toISOString() })); } catch { /* Temporary protection is best effort. */ }
+    const nextDraft = { ...contentDraftRef.current, [section]: value };
+    contentDraftRef.current = nextDraft;
+    pendingContentFieldsRef.current.add(section);
+    contentVersionRef.current += 1;
+    contentDirtyRef.current = true;
+    setContentDraft(nextDraft);
+    setContentDirty(true);
+    setSaveState("dirty");
+    try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePointId}`, JSON.stringify({ entity_id: selectedKnowledgePointId, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: nextDraft } })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateChapterNote = (value: RichDocument) => {
     if (!selectedPlacement) return;
@@ -1123,16 +1543,23 @@ function App() {
       placementEditSessionRef.current = { key: selectedPlacement.id, snapshot: JSON.parse(JSON.stringify(chapterNoteDraft)) as RichDocument, captured: false };
     }
     capturePlacementHistory();
+    chapterNoteDraftRef.current = value;
+    chapterNoteDirtyRef.current = true;
     setChapterNoteDraft(value); setChapterNoteDirty(true); setSaveState("dirty");
-    try { window.localStorage.setItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${selectedPlacement.id}`, JSON.stringify({ value, savedAt: new Date().toISOString() })); } catch { /* Temporary protection is best effort. */ }
+    try { window.localStorage.setItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${selectedPlacement.id}`, JSON.stringify({ entity_id: selectedPlacement.id, entity_type: "placement_note", base_revision: noteRevisionRef.current, saved_at: new Date().toISOString(), draft: { value } })); } catch { /* Temporary protection is best effort. */ }
   };
   const savePointMetadata = async (patch: Partial<Pick<KnowledgePoint, "title" | "status">>) => {
-    if (!selectedKnowledgePoint) return; setSaveState("saving"); setMessage("");
+    if (!selectedKnowledgePoint || coreSavePaused) return;
     capturePointHistory();
-    try {
-      const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint }>(endpoint("knowledge_point", { id: selectedKnowledgePoint.id }), { method: "PATCH", body: JSON.stringify(patch) });
-      setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === result.knowledge_point.id ? result.knowledge_point : point) })); setTitleDraft(result.knowledge_point.title); setSaveState(contentDirty || chapterNoteDirty ? "dirty" : "saved"); setMessage("知识点信息已保存。");
-    } catch (error) { setSaveState("error"); setMessage(`保存失败，当前输入仍保留：${error instanceof Error ? error.message : "网络连接异常。"}`); }
+    if (patch.title !== undefined) titleDraftRef.current = patch.title;
+    if (patch.status !== undefined) pointStatusDraftRef.current = patch.status;
+    setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === selectedKnowledgePoint.id ? { ...point, ...patch } : point) }));
+    if (patch.title !== undefined) setTitleDraft(patch.title);
+    pendingCoreMetadataRef.current = { ...pendingCoreMetadataRef.current, ...patch };
+    contentDirtyRef.current = true;
+    setContentDirty(true);
+    setSaveState("dirty");
+    try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePoint.id}`, JSON.stringify({ entity_id: selectedKnowledgePoint.id, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: contentDraftRef.current } })); } catch { /* Temporary protection is best effort. */ }
   };
   const navigateKnowledgePoint = (offset: -1 | 1) => {
     if (!selectedChapterId || !selectedKnowledgePointId) return; const placements = placementsOf(selectedChapterId); const index = placements.findIndex((placement) => placement.knowledge_point_id === selectedKnowledgePointId); const target = placements[index + offset]; if (target) selectKnowledgePoint(target);
@@ -1205,7 +1632,7 @@ function App() {
     return <div className="chapter-page"><div className="content-heading chapter-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2></div><div className="content-heading__tools"><button type="button" className="secondary-button chapter-new-child" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button><SaveBadge state={saveState} /><details className="more-menu"><summary aria-label="章节更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportChapter()}>导出本章 Word</button><button type="button" onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button type="button" onClick={() => renameChapter(selectedChapter)}>重命名</button><button type="button" onClick={() => deleteChapter(selectedChapter)} className="more-menu__danger">删除章节</button></>}</div></details></div></div>
       {organizeMode && <p className="organize-context">整理模式已开启</p>}
       {organizeMode && <div className="move-panel"><label htmlFor="chapter-move">移动章节到</label><select id="chapter-move" value={selectedChapter.parent_id ?? ""} disabled={busy} onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}><option value="">一级目录</option>{possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{chapterPath(parent.id)}</option>)}</select></div>}
-      <section className="chapter-overview"><div className="section-heading"><h3>章节总览</h3>{hasOverview && !chapterEditMode && <button type="button" className="text-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><button type="button" className="quiet-button overview-done" onClick={() => setChapterEditMode(false)}>完成</button></> : hasOverview ? <div className="chapter-overview__text">{selectedChapter.content}</div> : <button type="button" className="add-overview" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
+      <section className="chapter-overview"><div className="section-heading"><h3>章节总览</h3>{hasOverview && !chapterEditMode && <button type="button" className="text-link" onClick={beginChapterEdit}>编辑</button>}</div>{chapterEditMode ? <><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><button type="button" className="quiet-button overview-done" onClick={() => setChapterEditMode(false)}>完成</button></> : hasOverview ? <div className="chapter-overview__text">{selectedChapter.content}</div> : <button type="button" className="add-overview" onClick={beginChapterEdit}>＋ 添加章节说明</button>}</section>
       <div className="chapter-sequence">
         {children.length > 0 && <section className="subsection-card chapter-children-section"><div className="subsection-card__header"><div><h3>子章节</h3><span>继续深入当前目录</span></div><span>{children.length}</span></div><div className="chapter-child-list">{children.map((child) => <button type="button" className="chapter-child-link" key={child.id} onClick={() => selectChapter(child.id)}><span className="chapter-child-link__title">{child.title}</span><span className="chapter-child-link__arrow" aria-hidden="true">›</span></button>)}</div></section>}
         <section className="subsection-card chapter-points-section"><div className="subsection-card__header"><div><h3>知识点</h3><span>当前章节的讲义内容</span></div><div className="subsection-card__header-actions"><span>{placements.length}</span><button type="button" className="text-link knowledge-create-link" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div></div>{placements.length === 0 ? <div className="empty-state-inline"><strong>暂无知识点</strong><span>从这里开始整理这个章节。</span></div> : <div className="chapter-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); if (!point) return null; return <button type="button" className="chapter-point-link" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span className="content-list__body"><strong className="content-list__title">{point.title}</strong>{chapterPreviews[point.id] && <span className="content-list__preview">{chapterPreviews[point.id]}</span>}<em className={`status-text status-text--${point.status}`}>{pointStatusLabel(point.status)}</em></span><span className="content-list__arrow" aria-hidden="true">›</span></button>; })}</div>}</section>
@@ -1322,7 +1749,7 @@ function App() {
     <span className="mobile-access-row__main"><strong>{item.title}</strong><span>{item.path || label || (item.item_type === "chapter" ? "章节" : "知识点")}</span></span>
     <span className="mobile-access-row__meta">{item.status ? pointStatusLabel(item.status) : label ?? "›"}<span aria-hidden="true">›</span></span>
   </button>;
-  const renderMobileMessage = () => message && <div className={`mobile-message ${saveState === "error" ? "mobile-message--error" : ""}`} role="status">{message}</div>;
+  const renderMobileMessage = () => (message || conflictInfo) && <div className={`mobile-message ${saveState === "error" ? "mobile-message--error" : saveState === "conflict" ? "mobile-message--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="mobile-inline-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>;
 
   const renderMobileHome = () => {
     const continueItem = fastAccess.recent[0];
@@ -1361,7 +1788,7 @@ function App() {
       <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={mobileGoHome}>‹ 悠扬讲义</button><h1>{selectedChapter.title}</h1><div className="mobile-header__actions"><button type="button" className="mobile-icon-button mobile-child-create" aria-label="新建子章节" onClick={() => createChapter(selectedChapter.id)}>＋</button><button type="button" className="mobile-icon-button" aria-label="章节更多操作" onClick={() => setMobileSheet("chapter")}>···</button></div></header>
       {renderMobileMessage()}
       {selectedChapter.parent_id && <p className="mobile-path">{chapterPath(selectedChapter.id)}</p>}
-      <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} /><button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
+      <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={beginChapterEdit}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} /><button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={beginChapterEdit}>＋ 添加章节说明</button>}</section>
       {children.length > 0 && <section className="mobile-chapter-section mobile-chapter-children-section"><div className="mobile-section-heading"><div><h2>子章节</h2><span>继续深入当前目录</span></div><span>{children.length}</span></div><div className="mobile-child-list">{children.map((child) => <button type="button" className="mobile-child-row" key={child.id} onClick={() => selectChapter(child.id)}><span>{child.title}</span><span aria-hidden="true">›</span></button>)}</div></section>}
       <section className="mobile-chapter-section mobile-chapter-points-section"><div className="mobile-section-heading"><div><h2>知识点</h2><span>{placements.length} 个</span></div><button type="button" className="mobile-inline-link mobile-knowledge-create" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div>{placements.length === 0 ? <p className="mobile-empty">暂无知识点</p> : <div className="mobile-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button type="button" className="mobile-list-row mobile-list-row--point" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span><strong>{point.title}</strong>{chapterPreviews[point.id] && <small className="mobile-point-preview">{chapterPreviews[point.id]}</small>}<small className={`mobile-status-text mobile-status-text--${point.status}`}>{pointStatusLabel(point.status)}</small></span><span aria-hidden="true">›</span></button> : null; })}</div>}</section>
     </div>;
@@ -1394,6 +1821,24 @@ function App() {
     {!searchQuery.trim() ? <p className="mobile-search-empty">输入关键词开始搜索。</p> : searchLoading ? <p className="mobile-loading">正在搜索……</p> : searchError ? <p className="mobile-search-error">{searchError}</p> : searchResults.length === 0 ? <p className="mobile-search-empty">没有搜索结果，换一个关键词试试。</p> : <div className="mobile-search-results">{searchResults.map((result) => <button type="button" className="mobile-search-result" key={result.id} onClick={() => openSearchResult(result)}><strong>{result.title}</strong><span>{result.context?.path ?? result.paths[0] ?? "知识点"}</span><small>{result.match_types.map(matchTypeLabel).join(" · ")}{result.tags.length > 0 ? ` · ${result.tags.map((tag) => tag.name).join(" · ")}` : ""}</small>{result.context?.text && <p>{result.context.text}</p>}</button>)}</div>}
   </div>;
 
+  const renderConflictModal = () => {
+    if (!conflictInfo || !conflictModalOpen) return null;
+    const entityLabel = conflictInfo.entity === "knowledge_point_core" ? "知识点共享核心" : conflictInfo.entity === "placement_note" ? "本章补充" : "章节总览";
+    return <div className="conflict-overlay" role="presentation">
+      <section className="conflict-surface" role="dialog" aria-modal="true" aria-labelledby="conflict-title">
+        <div className="conflict-surface__icon" aria-hidden="true">!</div>
+        <p className="content-kicker">{entityLabel}</p>
+        <h2 id="conflict-title">检测到内容更新冲突</h2>
+        <p>这个内容已经在另一台设备或另一个页面更新。为了避免覆盖最新内容，本次修改没有保存到云端。</p>
+        <p className="conflict-surface__hint">刚才未保存的修改已保留在本机临时草稿中。加载云端最新版本不会自动覆盖这份草稿。</p>
+        <div className="conflict-surface__actions">
+          <button type="button" className="quiet-button" onClick={() => setConflictModalOpen(false)}>暂不处理</button>
+          <button type="button" className="primary-button" onClick={() => void loadLatestConflict()}>加载云端最新版本</button>
+        </div>
+      </section>
+    </div>;
+  };
+
   const renderDataSecurity = () => {
     if (!dataSecurityOpen) return null;
     return <div className="backup-overlay" role="presentation" onClick={() => { if (!backupBusy && !backupRestoring && !backupConfirmOpen) setDataSecurityOpen(false); }}>
@@ -1424,14 +1869,14 @@ function App() {
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
 
   if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">悠扬讲义</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button><details className="more-menu page-more-menu"><summary aria-label="全局更多操作">···</summary><div className="more-menu__content"><button type="button" onClick={openDataSecurity}>数据与安全</button></div></details></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
-    {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
+    {(message || conflictInfo) && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : saveState === "conflict" ? "message-bar--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="text-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
-    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main>;
+     <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }
