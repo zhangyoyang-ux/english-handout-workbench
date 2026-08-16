@@ -896,3 +896,10 @@ h1 { font-size: clamp(28px, 3.1vw, 40px); letter-spacing: -.045em; }
 @media (max-width: 560px) {
   .chapter-child-list { grid-template-columns: 1fr; }
 }
+
+.offline-reading-banner { display: flex; align-items: baseline; gap: 9px; margin: 18px 0 -8px; padding: 9px 12px; border: 1px solid #eadfbe; border-radius: 10px; background: #fff9e9; color: #856c32; font-size: 12px; }
+.offline-reading-banner small { color: #9b8961; font-size: 11px; }
+.mobile-workbench > .offline-reading-banner { margin: 0 14px 8px; }
+@media (max-width: 900px) {
+  .offline-reading-banner { flex-wrap: wrap; gap: 3px 8px; padding: 8px 10px; }
+}

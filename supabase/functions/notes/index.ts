@@ -2109,6 +2109,76 @@ async function readFastAccess(client: SupabaseClient) {
   return { recent, favorites, pins };
 }
 
+type OfflineSnapshotData = {
+  tree: {
+    chapters: Chapter[];
+    knowledge_points: KnowledgePoint[];
+    knowledge_point_placements: KnowledgePointPlacement[];
+  };
+  contents: Record<string, KnowledgePointContent>;
+  point_meta: Record<string, { tags: Tag[]; favorite: boolean; pinned: { id: string } | null }>;
+  tags: Tag[];
+  fast_access: Awaited<ReturnType<typeof readFastAccess>>;
+};
+
+async function buildOfflineSnapshot(client: SupabaseClient) {
+  const tree = await readTree(client);
+  const [contentRows, tagRows, tagLinkRows, favoriteRows, pinRows, fast_access] = await Promise.all([
+    readAllRows(client, "knowledge_point_contents", "id,knowledge_point_id,explanation,exercises,supplement,inspiration,created_at,updated_at", ["id"]),
+    readAllRows(client, "tags", "id,name,created_at,updated_at", ["id"]),
+    readAllRows(client, "knowledge_point_tags", "knowledge_point_id,tag_id,created_at", ["knowledge_point_id", "tag_id"]),
+    readAllRows(client, "favorite_items", "knowledge_point_id,created_at", ["knowledge_point_id"]),
+    readAllRows(client, "pinned_items", "id,item_type,item_id,sort_order,created_at", ["id"]),
+    readFastAccess(client),
+  ]);
+
+  const pointIds = new Set(tree.knowledge_points.map((point) => point.id));
+  const activeContents = (contentRows as unknown as KnowledgePointContent[]).filter((content) => pointIds.has(content.knowledge_point_id));
+  const activeTagLinks = (tagLinkRows as Array<Record<string, unknown>>).filter((link) => pointIds.has(String(link.knowledge_point_id)));
+  const usedTagIds = new Set(activeTagLinks.map((link) => String(link.tag_id)));
+  const tags = (tagRows as unknown as Tag[]).filter((tag) => usedTagIds.has(tag.id));
+  const tagsByPoint = new Map<string, Tag[]>();
+  const tagById = new Map(tags.map((tag) => [tag.id, tag]));
+  for (const link of activeTagLinks) {
+    const tag = tagById.get(String(link.tag_id));
+    if (!tag) continue;
+    const existing = tagsByPoint.get(String(link.knowledge_point_id)) ?? [];
+    existing.push(tag);
+    tagsByPoint.set(String(link.knowledge_point_id), existing);
+  }
+  const favoritePointIds = new Set((favoriteRows as Array<Record<string, unknown>>).map((row) => String(row.knowledge_point_id)));
+  const pinnedByPoint = new Map<string, { id: string }>();
+  for (const pin of pinRows as Array<Record<string, unknown>>) {
+    if (pin.item_type === "knowledge_point" && pointIds.has(String(pin.item_id))) pinnedByPoint.set(String(pin.item_id), { id: String(pin.id) });
+  }
+  const point_meta = Object.fromEntries(tree.knowledge_points.map((point) => [point.id, {
+    tags: tagsByPoint.get(point.id) ?? [],
+    favorite: favoritePointIds.has(point.id),
+    pinned: pinnedByPoint.get(point.id) ?? null,
+  }]));
+  const data: OfflineSnapshotData = {
+    tree,
+    contents: Object.fromEntries(activeContents.map((content) => [content.knowledge_point_id, content])),
+    point_meta,
+    tags,
+    fast_access,
+  };
+  return {
+    snapshot_version: 1 as const,
+    schema_version: "0016",
+    generated_at: new Date().toISOString(),
+    data_checksum: await hashCanonicalJson(data),
+    counts: {
+      chapters: tree.chapters.length,
+      knowledge_points: tree.knowledge_points.length,
+      placements: tree.knowledge_point_placements.length,
+      contents: activeContents.length,
+      tags: tags.length,
+    },
+    data,
+  };
+}
+
 async function searchKnowledgePoints(client: SupabaseClient, query: string, status: string | null, tagId: string | null) {
   const trimmedQuery = query.trim();
   if (!trimmedQuery) return [];
@@ -2359,6 +2429,14 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
       return json(request, 200, { ok: true, backup: await buildFullBackup(client) });
     } catch (error) {
       return databaseError(request, error, "完整备份生成失败，请重试。");
+    }
+  }
+
+  if (request.method === "GET" && resource === "offline_snapshot") {
+    try {
+      return json(request, 200, { ok: true, snapshot: await buildOfflineSnapshot(client) });
+    } catch (error) {
+      return databaseError(request, error, "离线阅读快照生成失败，请稍后重试。");
     }
   }
 

@@ -4,6 +4,7 @@ import type { JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import { createRoot } from "react-dom/client";
 import type { ExportContentInput, ExportSelection, ExportTreeInput } from "./wordExport";
+import { clearOfflineSnapshot, readOfflineSnapshot, writeOfflineSnapshot, type OfflineSnapshotEnvelope } from "./offline";
 import "./styles.css";
 
 type SaveState = "idle" | "dirty" | "saving" | "saved" | "error" | "conflict";
@@ -126,6 +127,14 @@ type SearchResult = {
 };
 type DiscoveryMeta = { tags: Tag[]; favorite: boolean; pinned: { id: string } | null };
 type FastAccess = { recent: AccessItem[]; favorites: AccessItem[]; pins: PinItem[] };
+type OfflineLibraryData = {
+  tree: TreeData;
+  contents: Record<string, KnowledgePointContent>;
+  point_meta: Record<string, DiscoveryMeta>;
+  tags: Tag[];
+  fast_access: FastAccess;
+};
+type OfflineSnapshot = OfflineSnapshotEnvelope<OfflineLibraryData>;
 type HistoryKind = "shared" | "placement";
 type HistorySnapshot = { title: string; status: PointStatus; content: ContentDraft };
 type HistoryVersion = {
@@ -467,6 +476,9 @@ function App() {
   const [organizeMode, setOrganizeMode] = useState(false);
   const [viewMode, setViewMode] = useState<"read" | "edit">("read");
   const [loading, setLoading] = useState(true);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  const [offlineReading, setOfflineReading] = useState(false);
+  const [offlineSnapshotInfo, setOfflineSnapshotInfo] = useState<{ generated_at: string; counts: Record<string, number> } | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -563,6 +575,10 @@ function App() {
   const noteContextRef = useRef<string | null>(null);
   const pointEditSessionRef = useRef<{ key: string; snapshot: HistorySnapshot; captured: boolean } | null>(null);
   const placementEditSessionRef = useRef<{ key: string; snapshot: RichDocument; captured: boolean } | null>(null);
+  const offlineSnapshotRef = useRef<OfflineSnapshot | null>(null);
+  const offlineRefreshTimerRef = useRef<number | null>(null);
+
+  const canWriteOnline = online && !offlineReading;
 
   const selectedChapter = tree.chapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
   const selectedKnowledgePoint = tree.knowledge_points.find((point) => point.id === selectedKnowledgePointId) ?? null;
@@ -572,9 +588,71 @@ function App() {
   const chapterMap = useMemo(() => new Map(tree.chapters.map((chapter) => [chapter.id, chapter])), [tree.chapters]);
   const pointMap = useMemo(() => new Map(tree.knowledge_points.map((point) => [point.id, point])), [tree.knowledge_points]);
 
+  const isUsableOfflineSnapshot = useCallback(async (snapshot: OfflineSnapshot | null) => {
+    if (!snapshot || snapshot.snapshot_version !== 1 || snapshot.schema_version !== "0016" || !snapshot.data?.tree) return false;
+    return await hashCanonicalJson(snapshot.data) === snapshot.data_checksum;
+  }, []);
+
+  const applyOfflineSnapshot = useCallback((snapshot: OfflineSnapshot, notice = "") => {
+    offlineSnapshotRef.current = snapshot;
+    setTree(snapshot.data.tree);
+    setTags(snapshot.data.tags ?? []);
+    setFastAccess(snapshot.data.fast_access ?? { recent: [], favorites: [], pins: [] });
+    setOfflineSnapshotInfo({ generated_at: snapshot.generated_at, counts: snapshot.counts });
+    setOfflineReading(true);
+    setLoading(false);
+    if (!contentDirtyRef.current && !chapterDirtyRef.current && !chapterNoteDirtyRef.current) {
+      setViewMode("read");
+      setOrganizeMode(false);
+      setChapterEditMode(false);
+    }
+    setMessage(notice || `离线阅读 · 最近同步：${formatBackupTime(snapshot.generated_at)}`);
+  }, []);
+
+  const loadCachedOfflineSnapshot = useCallback(async () => {
+    try {
+      const snapshot = await readOfflineSnapshot<OfflineLibraryData>();
+      if (!(await isUsableOfflineSnapshot(snapshot))) return false;
+      applyOfflineSnapshot(snapshot as OfflineSnapshot);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [applyOfflineSnapshot, isUsableOfflineSnapshot]);
+
+  const refreshOfflineSnapshot = useCallback(async () => {
+    const result = await requestJson<{ ok: true; snapshot: OfflineSnapshot }>(endpoint("offline_snapshot"));
+    const snapshot = result.snapshot;
+    if (!(await isUsableOfflineSnapshot(snapshot))) throw new Error("离线阅读快照校验失败。");
+    await writeOfflineSnapshot(snapshot);
+    offlineSnapshotRef.current = snapshot;
+    setTree(snapshot.data.tree);
+    setTags(snapshot.data.tags ?? []);
+    setFastAccess(snapshot.data.fast_access ?? { recent: [], favorites: [], pins: [] });
+    setOfflineSnapshotInfo({ generated_at: snapshot.generated_at, counts: snapshot.counts });
+    setOfflineReading(false);
+    return snapshot;
+  }, [isUsableOfflineSnapshot]);
+
+  const scheduleOfflineSnapshotRefresh = useCallback(() => {
+    if (!online || offlineReading) return;
+    if (offlineRefreshTimerRef.current !== null) window.clearTimeout(offlineRefreshTimerRef.current);
+    offlineRefreshTimerRef.current = window.setTimeout(() => {
+      offlineRefreshTimerRef.current = null;
+      void refreshOfflineSnapshot().catch(() => { /* Keep the previous healthy snapshot. */ });
+    }, 1500);
+  }, [offlineReading, online, refreshOfflineSnapshot]);
+
   const loadTree = useCallback(async (selection?: Selection) => {
+    if (offlineReading) {
+      if (selection?.knowledgePointId) { setSelectedKnowledgePointId(selection.knowledgePointId); setSelectedChapterId(selection.chapterId ?? null); }
+      else if (selection?.chapterId) { setSelectedKnowledgePointId(null); setSelectedChapterId(selection.chapterId); }
+      return;
+    }
     const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+    setOfflineReading(false);
     setTree({ chapters: result.chapters ?? [], knowledge_points: result.knowledge_points ?? [], knowledge_point_placements: result.knowledge_point_placements ?? [] });
+    scheduleOfflineSnapshotRefresh();
     if (selection?.knowledgePointId) {
       setSelectedKnowledgePointId(selection.knowledgePointId); setSelectedChapterId(selection.chapterId ?? null);
     } else if (selection?.chapterId) {
@@ -583,9 +661,10 @@ function App() {
       setSelectedKnowledgePointId(null);
       setSelectedChapterId(null);
     }
-  }, []);
+  }, [offlineReading, scheduleOfflineSnapshotRefresh]);
 
   const readFreshExportContext = useCallback(async (pointIds?: string[]) => {
+    if (offlineReading) throw new Error("当前处于离线阅读模式，联网后才能导出 Word。");
     const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
     const freshTree = { chapters: result.chapters ?? [], knowledge_points: result.knowledge_points ?? [], knowledge_point_placements: result.knowledge_point_placements ?? [] };
     const ids = pointIds ?? [...new Set(freshTree.knowledge_point_placements.map((placement) => placement.knowledge_point_id))];
@@ -594,9 +673,13 @@ function App() {
       return [pointId, contentResult.content ? contentDraftFromRecord(contentResult.content) as ExportContentInput : null] as const;
     }));
     return { tree: freshTree as unknown as ExportTreeInput, contents: new Map<string, ExportContentInput | null>(contentResults) };
-  }, []);
+  }, [offlineReading]);
 
   const exportIsReady = () => {
+    if (offlineReading) {
+      setMessage("当前处于离线阅读模式，联网后才能导出 Word。");
+      return false;
+    }
     if (exportBusy) return false;
     if (saveState === "saving" || saveState === "dirty" || saveState === "error" || saveState === "conflict" || contentDirty || chapterDirty || chapterNoteDirty) {
       setMessage("当前修改尚未成功保存，请先完成保存后再导出。");
@@ -658,6 +741,14 @@ function App() {
   const loadFastAccess = useCallback(async () => {
     setFastAccessLoading(true);
     try {
+      if (offlineReading) {
+        const snapshot = offlineSnapshotRef.current;
+        if (snapshot) {
+          setTags(snapshot.data.tags ?? []);
+          setFastAccess(snapshot.data.fast_access ?? { recent: [], favorites: [], pins: [] });
+        }
+        return;
+      }
       const [tagResult, accessResult] = await Promise.all([
         requestJson<{ ok: true; tags: Tag[] }>(endpoint("tags")),
         requestJson<{ ok: true } & FastAccess>(endpoint("fast_access")),
@@ -669,7 +760,7 @@ function App() {
     } finally {
       setFastAccessLoading(false);
     }
-  }, []);
+  }, [offlineReading]);
 
   const refreshFastAccess = useCallback(() => { void loadFastAccess(); }, [loadFastAccess]);
 
@@ -682,6 +773,7 @@ function App() {
   };
 
   const runIntegrityCheck = async () => {
+    if (!canWriteOnline) { setIntegrityError("当前处于离线阅读模式，联网后才能运行系统检查。"); return; }
     setIntegrityBusy(true); setIntegrityError(""); setIntegrityNotice("");
     try {
       const result = await requestJson<{ ok: true; report: IntegrityReport }>(endpoint("integrity_check"), { method: "POST" });
@@ -707,6 +799,7 @@ function App() {
   };
 
   const exportFullBackup = async () => {
+    if (!canWriteOnline) { setBackupError("当前处于离线阅读模式，联网后才能生成完整备份。"); return; }
     setBackupBusy(true); setBackupError(""); setBackupNotice("");
     try {
       const result = await requestJson<{ ok: true; backup: FullBackup }>(endpoint("backup"));
@@ -722,6 +815,7 @@ function App() {
   };
 
   const handleBackupFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    if (!canWriteOnline) { setBackupError("当前处于离线阅读模式，联网后才能校验和恢复备份。"); event.currentTarget.value = ""; return; }
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
     setBackupCandidate(null); setBackupPreflight(null); setBackupError(""); setBackupNotice("");
@@ -741,6 +835,7 @@ function App() {
   };
 
   const prepareBackupRestore = async () => {
+    if (!canWriteOnline) { setBackupError("当前处于离线阅读模式，联网后才能恢复备份。"); return; }
     if (!backupCandidate || !backupPreflight) return;
     setBackupBusy(true); setBackupError(""); setBackupNotice("");
     try {
@@ -760,12 +855,18 @@ function App() {
   };
 
   const executeBackupRestore = async () => {
+    if (!canWriteOnline) { setBackupError("当前处于离线阅读模式，联网后才能恢复备份。"); return; }
     if (!backupCandidate) return;
     setBackupRestoring(true); setBackupError("");
     try {
       const result = await requestJson<{ ok: true; restore: Record<string, unknown>; post_check: { passed: boolean } }>(endpoint("backup_restore"), { method: "POST", body: JSON.stringify({ backup: backupCandidate }) });
       if (!result.post_check?.passed) throw new Error("恢复后的数据校验未通过。");
       clearRestoreDrafts();
+      await clearOfflineSnapshot();
+      offlineSnapshotRef.current = null;
+      setOfflineSnapshotInfo(null);
+      setOfflineReading(false);
+      await refreshOfflineSnapshot();
       await loadTree();
       await loadFastAccess();
       setBackupConfirmOpen(false); setBackupCandidate(null); setBackupPreflight(null);
@@ -776,6 +877,25 @@ function App() {
   };
 
   const refreshPointContent = useCallback(async (pointId: string) => {
+    if (offlineReading) {
+      const snapshot = offlineSnapshotRef.current;
+      const point = snapshot?.data.tree.knowledge_points.find((item) => item.id === pointId);
+      if (!point) throw new Error("离线快照中没有这个知识点。");
+      const content = snapshot?.data.contents[pointId] ?? null;
+      const draft = contentDraftFromRecord(content);
+      coreRevisionRef.current = point.core_revision;
+      contentDraftRef.current = draft;
+      contentDirtyRef.current = false;
+      pendingCoreMetadataRef.current = {};
+      pendingContentFieldsRef.current.clear();
+      titleDraftRef.current = point.title;
+      pointStatusDraftRef.current = point.status;
+      setContentRecord(content);
+      setContentDraft(draft);
+      setTitleDraft(point.title);
+      setContentDirty(false);
+      return;
+    }
     const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
     const draft = contentDraftFromRecord(result.content);
     coreRevisionRef.current = result.knowledge_point.core_revision;
@@ -790,7 +910,7 @@ function App() {
     setContentDraft(draft);
     setTitleDraft(result.knowledge_point.title);
     setContentDirty(false);
-  }, []);
+  }, [offlineReading]);
 
   const loadHistory = useCallback(async (kind: HistoryKind, id: string) => {
     setHistoryLoading(true);
@@ -808,6 +928,7 @@ function App() {
   }, []);
 
   const openHistory = (kind: HistoryKind = "shared") => {
+    if (!canWriteOnline) { setMessage("历史版本需要联网读取，当前请先恢复网络。"); return; }
     const id = kind === "shared" ? selectedKnowledgePointId : selectedPlacementId;
     if (!id) return;
     setHistoryKind(kind);
@@ -830,6 +951,7 @@ function App() {
         await refreshPointContent(selectedKnowledgePointId);
         await loadTree({ chapterId: selectedChapterId ?? undefined, knowledgePointId: selectedKnowledgePointId });
       }
+      await refreshOfflineSnapshot();
       setHistoryConfirm(null);
       setHistoryPreview(null);
       setHistoryOpen(false);
@@ -857,12 +979,14 @@ function App() {
   }, [recycleFilter]);
 
   const openRecycleBin = (kind: "all" | "chapter" | "knowledge_point" = "all") => {
+    if (!canWriteOnline) { setMessage("回收站需要联网读取，当前请先恢复网络。"); return; }
     setRecycleFilter(kind);
     setRecycleOpen(true);
     void loadRecycleBin(kind);
   };
 
   const restoreRecycleItem = async (item: RecycleItem, restoreParents = false, targetChapterId?: string) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后才能恢复回收站内容。"); return; }
     try {
       await requestJson(endpoint("restore_recycle"), {
         method: "POST",
@@ -870,6 +994,7 @@ function App() {
       });
       await loadTree({ chapterId: selectedChapterId ?? undefined, knowledgePointId: selectedKnowledgePointId ?? undefined });
       await loadRecycleBin(recycleFilter);
+      await refreshOfflineSnapshot();
       setRecycleRestoreTarget(null);
       setMessage(`${item.item_type === "chapter" ? "章节" : "知识点"}已恢复，原 UUID 与可用引用保持不变。`);
     } catch (error) {
@@ -919,6 +1044,7 @@ function App() {
   }, [persistConflictDraft]);
 
   const flushChapterSave = useCallback(async (chapterId: string) => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，章节修改已暂存在本机，联网后才会同步。"); return; }
     if (chapterSaveInFlightRef.current) {
       chapterSaveQueuedRef.current = true;
       return;
@@ -952,6 +1078,7 @@ function App() {
       setSaveState(contentDirtyRef.current || chapterNoteDirtyRef.current || chapterDirtyRef.current ? "dirty" : "saved");
       setMessage("章节内容已保存到 Supabase PostgreSQL。");
       refreshFastAccess();
+      scheduleOfflineSnapshotRefresh();
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -970,9 +1097,10 @@ function App() {
         window.setTimeout(() => { void flushChapterSave(chapterId); }, AUTOSAVE_DELAY);
       }
     }
-  }, [chapterSavePaused, contentDirtyRef, openEditConflict, refreshFastAccess, selectedChapterId]);
+  }, [canWriteOnline, chapterSavePaused, contentDirtyRef, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedChapterId]);
 
   const flushContentSave = useCallback(async (pointId: string) => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，当前输入已暂存在本机，联网后才会同步。"); return; }
     if (contentSaveInFlightRef.current) {
       contentSaveQueuedRef.current = true;
       return;
@@ -1018,6 +1146,7 @@ function App() {
       setSaveState(stillDirty || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
       setMessage("共享核心已保存到 Supabase PostgreSQL。");
       refreshFastAccess();
+      scheduleOfflineSnapshotRefresh();
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -1036,9 +1165,10 @@ function App() {
         window.setTimeout(() => { void flushContentSave(pointId); }, AUTOSAVE_DELAY);
       }
     }
-  }, [coreSavePaused, openEditConflict, refreshFastAccess, selectedKnowledgePointId]);
+  }, [canWriteOnline, coreSavePaused, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedKnowledgePointId]);
 
   const flushNoteSave = useCallback(async (placementId: string) => {
+    if (!canWriteOnline) { setSaveState("error"); setMessage("网络已断开，本章补充已暂存在本机，联网后才会同步。"); return; }
     if (noteSaveInFlightRef.current) {
       noteSaveQueuedRef.current = true;
       return;
@@ -1072,6 +1202,7 @@ function App() {
       setSaveState(contentDirtyRef.current || chapterDirtyRef.current || chapterNoteDirtyRef.current ? "dirty" : "saved");
       setMessage("本章补充已保存到 Supabase PostgreSQL。");
       refreshFastAccess();
+      scheduleOfflineSnapshotRefresh();
     } catch (error) {
       if (error instanceof ApiRequestError && error.code === "EDIT_CONFLICT") {
         conflicted = true;
@@ -1090,7 +1221,7 @@ function App() {
         window.setTimeout(() => { void flushNoteSave(placementId); }, AUTOSAVE_DELAY);
       }
     }
-  }, [contentDirtyRef, chapterDirtyRef, noteSavePaused, openEditConflict, refreshFastAccess, selectedPlacementId]);
+  }, [canWriteOnline, contentDirtyRef, chapterDirtyRef, noteSavePaused, openEditConflict, refreshFastAccess, scheduleOfflineSnapshotRefresh, selectedPlacementId]);
 
   const applyFreshPointResult = useCallback((result: { knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }) => {
     const draft = contentDraftFromRecord(result.content);
@@ -1213,10 +1344,50 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    void loadTree().catch((error) => { if (!cancelled) setMessage(error instanceof Error ? error.message : "目录读取失败。"); }).finally(() => { if (!cancelled) setLoading(false); });
+    void refreshOfflineSnapshot()
+      .then(() => { if (!cancelled) { setOnline(true); setMessage(""); } })
+      .catch(async (error) => {
+        if (cancelled) return;
+        const cached = await loadCachedOfflineSnapshot();
+        if (!cached) {
+          try {
+            setOnline(navigator.onLine);
+            await loadTree();
+          } catch (treeError) {
+            setMessage(navigator.onLine
+              ? treeError instanceof Error ? treeError.message : error instanceof Error ? error.message : "目录读取失败。"
+              : "暂无可用的离线讲义。请联网打开一次悠扬讲义后再使用离线阅读。");
+          }
+        }
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [loadTree]);
+  }, [loadCachedOfflineSnapshot, loadTree, refreshOfflineSnapshot]);
   useEffect(() => { void loadFastAccess(); }, [loadFastAccess]);
+  useEffect(() => {
+    const handleOffline = () => {
+      setOnline(false);
+      void loadCachedOfflineSnapshot();
+      if (!contentDirtyRef.current && !chapterDirtyRef.current && !chapterNoteDirtyRef.current) {
+        setViewMode("read");
+        setOrganizeMode(false);
+        setChapterEditMode(false);
+      }
+      setMessage("网络已断开，当前为离线阅读模式。已同步内容仍可只读查看。");
+    };
+    const handleOnline = () => {
+      setOnline(true);
+      void refreshOfflineSnapshot()
+        .then(() => { setMessage("已恢复在线，正在使用最新 Production 数据。"); void loadFastAccess(); })
+        .catch(() => setMessage("网络已恢复，但云端读取失败，继续使用最近一次离线快照。"));
+    };
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [loadCachedOfflineSnapshot, loadFastAccess, refreshOfflineSnapshot]);
   useEffect(() => { try { window.localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expandedIds])); } catch { /* Optional UI state. */ } }, [expandedIds]);
   useEffect(() => {
     const query = searchQuery.trim();
@@ -1228,6 +1399,12 @@ function App() {
     }
     setSearchLoading(true);
     setSearchError("");
+    if (offlineReading) {
+      setSearchResults([]);
+      setSearchError("离线阅读暂不提供全文搜索，请通过目录进入知识点。");
+      setSearchLoading(false);
+      return;
+    }
     const timer = window.setTimeout(() => {
       const params: Record<string, string> = { q: query };
       if (searchStatus) params.status = searchStatus;
@@ -1238,7 +1415,7 @@ function App() {
         .finally(() => setSearchLoading(false));
     }, 320);
     return () => window.clearTimeout(timer);
-  }, [searchQuery, searchStatus, searchTagId]);
+  }, [offlineReading, searchQuery, searchStatus, searchTagId]);
   useEffect(() => {
     if (!selectedChapterId) return;
     const ancestors = new Set<string>(); let current = chapterMap.get(selectedChapterId);
@@ -1288,7 +1465,15 @@ function App() {
       setContentRecord(null); setContentDraft(emptyContentDraft()); setContentDirty(false); setTitleDraft(""); pendingContentFieldsRef.current.clear(); return;
     }
     const requestId = ++contentRequestRef.current;
-    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); pendingCoreMetadataRef.current = {}; coreRevisionRef.current = null; contentDraftRef.current = emptyContentDraft(); contentDirtyRef.current = false; titleDraftRef.current = ""; pointStatusDraftRef.current = null; setCoreSavePaused(false); setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(""); setSaveState("saved"); setMessage("");
+    const preserveOfflineDraft = offlineReading && (contentDirtyRef.current || chapterNoteDirtyRef.current);
+    if (preserveOfflineDraft) { setContentLoading(false); return; }
+    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); pendingCoreMetadataRef.current = {}; coreRevisionRef.current = null; contentDraftRef.current = emptyContentDraft(); contentDirtyRef.current = false; titleDraftRef.current = ""; pointStatusDraftRef.current = null; setCoreSavePaused(false); if (!preserveOfflineDraft) setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(""); setSaveState("saved"); setMessage("");
+    if (offlineReading) {
+      void refreshPointContent(pointId)
+        .catch((error) => { if (requestId !== contentRequestRef.current) return; setSaveState("error"); setMessage(`离线内容读取失败：${error instanceof Error ? error.message : "离线快照不可用。"}`); })
+        .finally(() => { if (requestId === contentRequestRef.current) setContentLoading(false); });
+      return;
+    }
     void requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }))
       .then((result) => {
         if (requestId !== contentRequestRef.current) return;
@@ -1303,7 +1488,7 @@ function App() {
       })
       .catch((error) => { if (requestId !== contentRequestRef.current) return; setSaveState("error"); setMessage(`知识点内容读取失败：${error instanceof Error ? error.message : "网络连接异常。"}`); })
       .finally(() => { if (requestId === contentRequestRef.current) setContentLoading(false); });
-  }, [selectedKnowledgePointId]);
+  }, [offlineReading, refreshPointContent, selectedKnowledgePointId]);
 
   useEffect(() => {
     if (!selectedChapterId) {
@@ -1318,6 +1503,10 @@ function App() {
     let cancelled = false;
     void Promise.all(pointIds.map(async (pointId) => {
       try {
+        if (offlineReading) {
+          const content = offlineSnapshotRef.current?.data.contents[pointId] ?? null;
+          return [pointId, richDocumentPreview(content?.explanation)] as const;
+        }
         const result = await requestJson<{ ok: true; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
         return [pointId, richDocumentPreview(result.content?.explanation)] as const;
       } catch {
@@ -1328,15 +1517,19 @@ function App() {
       setChapterPreviews(entries.reduce<Record<string, string>>((result, [pointId, preview]) => { result[pointId] = preview; return result; }, {}));
     });
     return () => { cancelled = true; };
-  }, [selectedChapterId, tree.knowledge_point_placements]);
+  }, [offlineReading, selectedChapterId, tree.knowledge_point_placements]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
     if (!pointId) { setPointMeta(null); setTagPickerOpen(false); return; }
+    if (offlineReading) {
+      setPointMeta(offlineSnapshotRef.current?.data.point_meta[pointId] ?? { tags: [], favorite: false, pinned: null });
+      return;
+    }
     void requestJson<{ ok: true } & DiscoveryMeta>(endpoint("discovery_meta", { id: pointId }))
       .then((result) => setPointMeta({ tags: result.tags ?? [], favorite: result.favorite, pinned: result.pinned ?? null }))
       .catch((error) => setMessage(error instanceof Error ? error.message : "知识点快速访问信息读取失败。"));
-  }, [selectedKnowledgePointId]);
+  }, [offlineReading, selectedKnowledgePointId]);
 
   useEffect(() => {
     if (noteContextRef.current === selectedPlacementId) return;
@@ -1398,7 +1591,12 @@ function App() {
     openAccessItem({ item_type: "knowledge_point", item_id: result.id, chapter_id: result.context?.chapter_id ?? result.chapter_id, placement_id: contextPlacementId });
   };
   const toggleExpanded = (chapterId: string) => setExpandedIds((previous) => { const next = new Set(previous); if (next.has(chapterId)) next.delete(chapterId); else next.add(chapterId); return next; });
-  const mutate = async (action: () => Promise<void>) => { if (busy) return; setBusy(true); try { await action(); } catch (error) { setMessage(error instanceof Error ? error.message : "操作失败，请稍后重试。"); } finally { setBusy(false); } };
+  const mutate = async (action: () => Promise<void>) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
+    if (busy) return;
+    setBusy(true);
+    try { await action(); } catch (error) { setMessage(error instanceof Error ? error.message : "操作失败，请稍后重试。"); } finally { setBusy(false); }
+  };
 
   const toggleFavorite = () => {
     if (!selectedKnowledgePoint || !pointMeta) return;
@@ -1451,10 +1649,12 @@ function App() {
   };
 
   const createChapter = (parentId: string | null) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     const title = window.prompt(parentId ? "新建子章节名称" : "新建一级章节名称", ""); if (title === null || !title.trim()) return;
     void mutate(async () => { const result = await requestJson<{ ok: true; chapter: Chapter }>(endpoint("chapter"), { method: "POST", body: JSON.stringify({ title: title.trim(), parent_id: parentId }) }); await loadTree({ chapterId: result.chapter.id }); if (parentId) setExpandedIds((previous) => new Set([...previous, parentId])); setMessage("章节已创建。"); });
   };
   const createKnowledgePoint = (chapterId: string) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     const title = window.prompt("新建知识点名称", ""); if (title === null || !title.trim()) return;
     void mutate(async () => { const result = await requestJson<{ ok: true; point: KnowledgePoint; placement: Placement }>(endpoint("knowledge_point"), { method: "POST", body: JSON.stringify({ title: title.trim(), chapter_id: chapterId }) }); await loadTree({ chapterId, knowledgePointId: result.point.id }); setExpandedIds((previous) => new Set([...previous, chapterId])); setMessage("知识点已创建，默认状态为草稿。"); });
   };
@@ -1484,6 +1684,7 @@ function App() {
     void mutate(async () => { await requestJson(endpoint("placement", { id: selectedPlacement.id }), { method: "DELETE" }); await loadTree({ chapterId: selectedChapterId ?? undefined }); setMessage("已从当前章节移除引用，共享知识点仍然保留。"); });
   };
   const addReferenceToChapter = (chapterId: string) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     if (!selectedKnowledgePointId || referenceBusy) return;
     setReferenceBusy(true); setMessage("");
     void requestJson<{ ok: true; placement: Placement }>(endpoint("placement"), { method: "POST", body: JSON.stringify({ knowledge_point_id: selectedKnowledgePointId, chapter_id: chapterId }) })
@@ -1520,6 +1721,7 @@ function App() {
     };
   };
   const beginPointEdit = () => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     if (!selectedKnowledgePoint) return;
     void (async () => {
       try {
@@ -1545,6 +1747,7 @@ function App() {
     })();
   };
   const beginChapterEdit = () => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     if (!selectedChapter) return;
     void (async () => {
       try {
@@ -1584,6 +1787,7 @@ function App() {
   };
 
   const updateChapterContent = (content: string) => {
+    if (!canWriteOnline) { setMessage("网络已断开，当前为只读离线阅读模式。"); return; }
     if (!selectedChapterId) return;
     chapterContentRef.current = content;
     chapterDirtyRef.current = true;
@@ -1593,6 +1797,7 @@ function App() {
     try { window.localStorage.setItem(`english-handout-workbench:phase2:chapter:${selectedChapterId}`, JSON.stringify({ content, savedAt: new Date().toISOString(), base_revision: overviewRevisionRef.current })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateContentSection = (section: ContentSection, value: RichDocument) => {
+    if (!canWriteOnline) { setMessage("网络已断开，当前为只读离线阅读模式。"); return; }
     capturePointHistory();
     const nextDraft = { ...contentDraftRef.current, [section]: value };
     contentDraftRef.current = nextDraft;
@@ -1605,6 +1810,7 @@ function App() {
     try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePointId}`, JSON.stringify({ entity_id: selectedKnowledgePointId, entity_type: "knowledge_point_core", base_revision: coreRevisionRef.current, saved_at: new Date().toISOString(), draft: { title: titleDraftRef.current, status: pointStatusDraftRef.current, content: nextDraft } })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateChapterNote = (value: RichDocument) => {
+    if (!canWriteOnline) { setMessage("网络已断开，当前为只读离线阅读模式。"); return; }
     if (!selectedPlacement) return;
     if (!placementEditSessionRef.current || placementEditSessionRef.current.key !== selectedPlacement.id) {
       placementEditSessionRef.current = { key: selectedPlacement.id, snapshot: JSON.parse(JSON.stringify(chapterNoteDraft)) as RichDocument, captured: false };
@@ -1616,6 +1822,7 @@ function App() {
     try { window.localStorage.setItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${selectedPlacement.id}`, JSON.stringify({ entity_id: selectedPlacement.id, entity_type: "placement_note", base_revision: noteRevisionRef.current, saved_at: new Date().toISOString(), draft: { value } })); } catch { /* Temporary protection is best effort. */ }
   };
   const savePointMetadata = async (patch: Partial<Pick<KnowledgePoint, "title" | "status">>) => {
+    if (!canWriteOnline) { setMessage("当前处于离线阅读模式，联网后可以继续编辑。"); return; }
     if (!selectedKnowledgePoint || coreSavePaused) return;
     capturePointHistory();
     if (patch.title !== undefined) titleDraftRef.current = patch.title;
@@ -1817,6 +2024,7 @@ function App() {
     <span className="mobile-access-row__meta">{item.status ? pointStatusLabel(item.status) : label ?? "›"}<span aria-hidden="true">›</span></span>
   </button>;
   const renderMobileMessage = () => (message || conflictInfo) && <div className={`mobile-message ${saveState === "error" ? "mobile-message--error" : saveState === "conflict" ? "mobile-message--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="mobile-inline-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>;
+  const renderOfflineBanner = () => offlineReading ? <div className="offline-reading-banner" role="status"><span>离线阅读</span><small>当前显示最近一次同步的内容{offlineSnapshotInfo ? ` · 最近同步：${formatBackupTime(offlineSnapshotInfo.generated_at)}` : ""}</small></div> : null;
 
   const renderMobileHome = () => {
     const continueItem = fastAccess.recent[0];
@@ -1940,16 +2148,20 @@ function App() {
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{renderOfflineBanner()}{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
 
   if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">悠扬讲义</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button><details className="more-menu page-more-menu"><summary aria-label="全局更多操作">···</summary><div className="more-menu__content"><button type="button" onClick={openDataSecurity}>数据与安全</button></div></details></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
-    {(message || conflictInfo) && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : saveState === "conflict" ? "message-bar--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="text-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>}
+    {renderOfflineBanner()}{(message || conflictInfo) && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : saveState === "conflict" ? "message-bar--conflict" : ""}`} role={saveState === "conflict" ? "alert" : "status"}><span>{message || "检测到内容更新冲突。当前输入已保留在本机草稿中。"}</span>{conflictInfo && !conflictModalOpen && <button type="button" className="text-link" onClick={() => setConflictModalOpen(true)}>查看冲突</button>}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
      <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}{renderConflictModal()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }
+
+if ("serviceWorker" in navigator) {
+  void navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`, { scope: import.meta.env.BASE_URL }).catch(() => { /* Offline reading remains optional if SW is unavailable. */ });
+}
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);
