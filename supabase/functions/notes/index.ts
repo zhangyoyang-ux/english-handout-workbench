@@ -505,6 +505,572 @@ async function restoreFullBackup(client: SupabaseClient, backup: FullBackup) {
   return { restore: data as Record<string, unknown>, post_check: postCheck };
 }
 
+type IntegrityIssueSeverity = "WARNING" | "ERROR";
+type IntegritySectionStatus = "PASS" | "WARNING" | "ERROR" | "CHECK_FAILED";
+type IntegrityIssue = {
+  severity: IntegrityIssueSeverity;
+  code: string;
+  message: string;
+  entity_type?: string;
+  entity_id?: string;
+  related_ids?: string[];
+};
+type IntegrityTableResult = { rows: Array<Record<string, unknown>>; error: unknown | null };
+type IntegrityTables = Partial<Record<BackupTableName, IntegrityTableResult>>;
+type IntegritySection = {
+  key: string;
+  label: string;
+  status: IntegritySectionStatus;
+  summary: string;
+  checked: number;
+  issue_count: number;
+  error_count: number;
+  warning_count: number;
+  displayed_issue_count: number;
+  truncated_issue_count: number;
+  issues: IntegrityIssue[];
+};
+type IntegrityReport = {
+  status: "PASS" | "WARNING" | "ERROR" | "CHECK_FAILED";
+  checked_at: string;
+  schema_version: string;
+  backup_format_version: 1;
+  issue_count: number;
+  summary: string;
+  sections: IntegritySection[];
+  report_text: string;
+};
+
+const INTEGRITY_ISSUE_DISPLAY_LIMIT = 80;
+
+function integrityRows(tables: IntegrityTables, table: BackupTableName) {
+  return tables[table]?.rows ?? [];
+}
+
+function integrityTableFailed(tables: IntegrityTables, table: BackupTableName) {
+  return !tables[table] || Boolean(tables[table]?.error);
+}
+
+function integrityAnyTableFailed(tables: IntegrityTables, requiredTables: BackupTableName[]) {
+  return requiredTables.some((table) => integrityTableFailed(tables, table));
+}
+
+function createIntegrityCollector() {
+  const issues: IntegrityIssue[] = [];
+  let issueCount = 0;
+  let errorCount = 0;
+  let warningCount = 0;
+  const add = (issue: IntegrityIssue) => {
+    issueCount += 1;
+    if (issue.severity === "ERROR") errorCount += 1;
+    else warningCount += 1;
+    if (issues.length < INTEGRITY_ISSUE_DISPLAY_LIMIT) issues.push(issue);
+  };
+  return { issues, add, get issueCount() { return issueCount; }, get errorCount() { return errorCount; }, get warningCount() { return warningCount; } };
+}
+
+function integritySection(
+  key: string,
+  label: string,
+  checked: number,
+  collector: ReturnType<typeof createIntegrityCollector>,
+  failed: boolean,
+): IntegritySection {
+  const status: IntegritySectionStatus = failed
+    ? "CHECK_FAILED"
+    : collector.errorCount > 0
+      ? "ERROR"
+      : collector.warningCount > 0
+        ? "WARNING"
+        : "PASS";
+  const summary = failed
+    ? "未能读取本项所需的全部数据，检查未完整完成。"
+    : status === "ERROR"
+      ? `发现 ${collector.errorCount} 个错误。`
+      : status === "WARNING"
+        ? `发现 ${collector.warningCount} 个需要留意的警告。`
+        : `已检查 ${checked} 项，未发现问题。`;
+  return {
+    key,
+    label,
+    status,
+    summary,
+    checked,
+    issue_count: collector.issueCount,
+    error_count: collector.errorCount,
+    warning_count: collector.warningCount,
+    displayed_issue_count: collector.issues.length,
+    truncated_issue_count: Math.max(0, collector.issueCount - collector.issues.length),
+    issues: collector.issues,
+  };
+}
+
+async function readIntegrityTables(client: SupabaseClient): Promise<IntegrityTables> {
+  const columns: Record<BackupTableName, string> = {
+    stage1_notes: "id,title,content,created_at,updated_at",
+    workbench_initialization: "key,initialized_at",
+    chapters: "id,title,parent_id,sort_order,content,created_at,updated_at,deleted_at,deletion_batch_id,overview_revision",
+    knowledge_points: "id,title,status,created_at,updated_at,deleted_at,deletion_batch_id,core_revision",
+    knowledge_point_contents: "id,knowledge_point_id,explanation,exercises,supplement,inspiration,created_at,updated_at",
+    knowledge_point_placements: "id,knowledge_point_id,chapter_id,sort_order,created_at,chapter_note,deleted_at,deletion_batch_id,note_revision",
+    tags: "id,name,created_at,updated_at",
+    knowledge_point_tags: "knowledge_point_id,tag_id,created_at",
+    favorite_items: "knowledge_point_id,created_at",
+    pinned_items: "id,item_type,item_id,sort_order,created_at",
+    knowledge_point_versions: "id,knowledge_point_id,snapshot,content_hash,version_source,created_at",
+    placement_note_versions: "id,placement_id,chapter_note_snapshot,content_hash,version_source,created_at",
+  };
+  const results = await Promise.all(BACKUP_TABLES.map(async (table) => {
+    try {
+      const orderColumns = table === "workbench_initialization"
+        ? ["key"]
+        : table === "knowledge_point_tags"
+          ? ["knowledge_point_id", "tag_id"]
+          : table === "favorite_items"
+            ? ["knowledge_point_id"]
+          : ["id"];
+      const rows = await readAllRows<Record<string, unknown>>(client, table, columns[table], orderColumns);
+      return [table, { rows, error: null }] as const;
+    } catch (error) {
+      return [table, { rows: [], error }] as const;
+    }
+  }));
+  return Object.fromEntries(results) as IntegrityTables;
+}
+
+function integrityIsActive(row: Record<string, unknown>) {
+  return row.deleted_at === null;
+}
+
+function integrityIsDeleted(row: Record<string, unknown>) {
+  return typeof row.deleted_at === "string";
+}
+
+function integrityId(row: Record<string, unknown>, key = "id") {
+  return typeof row[key] === "string" ? row[key] : undefined;
+}
+
+function integrityValidSort(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function integrityValidRevision(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function integrityValidDate(value: unknown) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function integrityRichDocument(value: unknown): { valid: boolean; reason?: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { valid: false, reason: "根节点不是对象" };
+  const root = value as Record<string, unknown>;
+  if (root.type !== "doc") return { valid: false, reason: "根节点 type 不是 doc" };
+  if (!Array.isArray(root.content)) return { valid: false, reason: "根节点缺少 content 数组" };
+  try {
+    if (JSON.stringify(value).length > MAX_RICH_DOCUMENT_LENGTH) return { valid: false, reason: "富文本内容超过长度限制" };
+  } catch {
+    return { valid: false, reason: "富文本内容无法序列化" };
+  }
+  const walk = (node: unknown): string | null => {
+    if (typeof node !== "object" || node === null || Array.isArray(node)) return "节点不是对象";
+    const record = node as Record<string, unknown>;
+    if (typeof record.type !== "string" || record.type.length === 0) return "节点缺少 type";
+    if (record.type === "text" && typeof record.text !== "string") return "text 节点缺少文字";
+    if (record.type !== "text" && record.text !== undefined) return "非 text 节点包含 text";
+    if (record.marks !== undefined && (!Array.isArray(record.marks) || record.marks.some((mark) => typeof mark !== "object" || mark === null || Array.isArray(mark) || typeof (mark as Record<string, unknown>).type !== "string"))) return "marks 结构无效";
+    if (record.attrs !== undefined && (typeof record.attrs !== "object" || record.attrs === null || Array.isArray(record.attrs))) return "attrs 结构无效";
+    if (record.content !== undefined) {
+      if (!Array.isArray(record.content)) return "content 结构无效";
+      for (const child of record.content) {
+        const reason = walk(child);
+        if (reason) return reason;
+      }
+    }
+    return null;
+  };
+  for (const child of root.content) {
+    const reason = walk(child);
+    if (reason) return { valid: false, reason };
+  }
+  return { valid: true };
+}
+
+function integrityHistorySnapshot(value: unknown): { valid: boolean; reason?: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { valid: false, reason: "历史快照不是对象" };
+  const snapshot = value as Record<string, unknown>;
+  if (!isNonEmptyTitle(snapshot.title)) return { valid: false, reason: "历史快照标题无效" };
+  if (typeof snapshot.status !== "string" || !STATUS_VALUES.has(snapshot.status)) return { valid: false, reason: "历史快照状态无效" };
+  if (typeof snapshot.content !== "object" || snapshot.content === null || Array.isArray(snapshot.content)) return { valid: false, reason: "历史快照缺少 content" };
+  const content = snapshot.content as Record<string, unknown>;
+  for (const field of CONTENT_FIELDS) {
+    const result = integrityRichDocument(content[field]);
+    if (!result.valid) return { valid: false, reason: `${field}：${result.reason ?? "富文本结构无效"}` };
+  }
+  return { valid: true };
+}
+
+async function integrityHashMatches(value: unknown, storedHash: unknown) {
+  return typeof storedHash === "string" && /^[0-9a-f]{64}$/i.test(storedHash) && storedHash.toLowerCase() === (await hashJson(value)).toLowerCase();
+}
+
+function integrityCheckChapters(tables: IntegrityTables) {
+  const rows = integrityRows(tables, "chapters");
+  const collector = createIntegrityCollector();
+  const byId = new Map<string, Record<string, unknown>>();
+  const activeChildren = new Map<string, Record<string, unknown>[]>();
+  for (const row of rows) {
+    const id = integrityId(row);
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "CHAPTER_ID_INVALID", message: "章节 ID 无效。", entity_type: "chapter", entity_id: id });
+    else if (byId.has(id)) collector.add({ severity: "ERROR", code: "CHAPTER_ID_DUPLICATE", message: "章节 ID 重复。", entity_type: "chapter", entity_id: id });
+    else byId.set(id, row);
+    if (!isNonEmptyTitle(row.title)) collector.add({ severity: "ERROR", code: "CHAPTER_TITLE_INVALID", message: "章节标题为空或超过长度限制。", entity_type: "chapter", entity_id: id });
+    if (!integrityValidSort(row.sort_order)) collector.add({ severity: "ERROR", code: "CHAPTER_SORT_INVALID", message: "章节排序值无效。", entity_type: "chapter", entity_id: id });
+    if (!integrityValidDate(row.created_at) || !integrityValidDate(row.updated_at)) collector.add({ severity: "ERROR", code: "CHAPTER_TIMESTAMP_INVALID", message: "章节时间字段无效。", entity_type: "chapter", entity_id: id });
+    if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "CHAPTER_DELETED_AT_INVALID", message: "章节 deleted_at 字段无效。", entity_type: "chapter", entity_id: id });
+    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "CHAPTER_DELETION_BATCH_MISSING", message: "回收站章节缺少删除批次标记。", entity_type: "chapter", entity_id: id });
+    if (integrityIsActive(row)) {
+      const parentId = row.parent_id === null ? null : typeof row.parent_id === "string" ? row.parent_id : undefined;
+      const siblingKey = parentId ?? "__root__";
+      const siblings = activeChildren.get(siblingKey) ?? [];
+      siblings.push(row);
+      activeChildren.set(siblingKey, siblings);
+    }
+  }
+  for (const row of rows) if (integrityIsActive(row)) {
+    const id = integrityId(row);
+    const parentId = row.parent_id === null ? null : typeof row.parent_id === "string" ? row.parent_id : undefined;
+    if (parentId === undefined) collector.add({ severity: "ERROR", code: "CHAPTER_PARENT_INVALID", message: "活动章节的 parent_id 无效。", entity_type: "chapter", entity_id: id });
+    else if (parentId === id) collector.add({ severity: "ERROR", code: "CHAPTER_SELF_PARENT", message: "章节不能把自己设为父章节。", entity_type: "chapter", entity_id: id });
+    else if (parentId && !byId.has(parentId)) collector.add({ severity: "ERROR", code: "CHAPTER_PARENT_MISSING", message: "活动章节的父章节不存在。", entity_type: "chapter", entity_id: id, related_ids: [parentId] });
+    else if (parentId && integrityIsDeleted(byId.get(parentId)!)) collector.add({ severity: "ERROR", code: "CHAPTER_PARENT_DELETED", message: "活动章节的父章节在回收站中。", entity_type: "chapter", entity_id: id, related_ids: [parentId] });
+  }
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const stack: string[] = [];
+  const cycles = new Set<string>();
+  const visit = (id: string) => {
+    if (visiting.has(id)) {
+      const start = stack.indexOf(id);
+      const cycle = stack.slice(start).sort().join(",");
+      if (cycle && !cycles.has(cycle)) {
+        cycles.add(cycle);
+        collector.add({ severity: "ERROR", code: "CHAPTER_CYCLE", message: "章节父子关系存在循环。", entity_type: "chapter", related_ids: stack.slice(start) });
+      }
+      return;
+    }
+    if (visited.has(id)) return;
+    visiting.add(id); stack.push(id);
+    const parentId = byId.get(id)?.parent_id;
+    if (typeof parentId === "string" && parentId !== id && byId.has(parentId)) visit(parentId);
+    stack.pop(); visiting.delete(id); visited.add(id);
+  };
+  for (const id of byId.keys()) visit(id);
+  for (const [parentId, siblings] of activeChildren) {
+    const sortMap = new Map<string, string[]>();
+    for (const sibling of siblings) {
+      const sort = String(sibling.sort_order);
+      const ids = sortMap.get(sort) ?? [];
+      if (integrityId(sibling)) ids.push(integrityId(sibling)!);
+      sortMap.set(sort, ids);
+    }
+    for (const [sort, ids] of sortMap) if (ids.length > 1) collector.add({ severity: "WARNING", code: "CHAPTER_SORT_DUPLICATE", message: `同一父章节下有多个活动章节使用排序值 ${sort}。`, entity_type: "chapter_group", related_ids: [parentId, ...ids] });
+  }
+  return integritySection("chapters", "章节目录", rows.length, collector, integrityTableFailed(tables, "chapters"));
+}
+
+function integrityCheckKnowledgePoints(tables: IntegrityTables) {
+  const points = integrityRows(tables, "knowledge_points");
+  const contents = integrityRows(tables, "knowledge_point_contents");
+  const collector = createIntegrityCollector();
+  const byId = new Map<string, Record<string, unknown>>();
+  const contentByPoint = new Map<string, Record<string, unknown>[]>();
+  for (const row of points) {
+    const id = integrityId(row);
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_ID_INVALID", message: "知识点 ID 无效。", entity_type: "knowledge_point", entity_id: id });
+    else if (byId.has(id)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_ID_DUPLICATE", message: "知识点 ID 重复。", entity_type: "knowledge_point", entity_id: id });
+    else byId.set(id, row);
+    if (!isNonEmptyTitle(row.title)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_TITLE_INVALID", message: "知识点标题为空或超过长度限制。", entity_type: "knowledge_point", entity_id: id });
+    if (typeof row.status !== "string" || !STATUS_VALUES.has(row.status)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_STATUS_INVALID", message: "知识点状态无效。", entity_type: "knowledge_point", entity_id: id });
+    if (!integrityValidDate(row.created_at) || !integrityValidDate(row.updated_at)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_TIMESTAMP_INVALID", message: "知识点时间字段无效。", entity_type: "knowledge_point", entity_id: id });
+    if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_DELETED_AT_INVALID", message: "知识点 deleted_at 字段无效。", entity_type: "knowledge_point", entity_id: id });
+    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "KNOWLEDGE_POINT_DELETION_BATCH_MISSING", message: "回收站知识点缺少删除批次标记。", entity_type: "knowledge_point", entity_id: id });
+    if (integrityIsActive(row) && !integrityValidRevision(row.core_revision)) collector.add({ severity: "ERROR", code: "CORE_REVISION_INVALID", message: "活动知识点的版本号无效。", entity_type: "knowledge_point", entity_id: id });
+  }
+  for (const row of contents) {
+    const id = integrityId(row);
+    const pointId = typeof row.knowledge_point_id === "string" ? row.knowledge_point_id : undefined;
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "CONTENT_ID_INVALID", message: "知识点正文记录 ID 无效。", entity_type: "knowledge_point_content", entity_id: id });
+    if (!pointId || !byId.has(pointId)) collector.add({ severity: "ERROR", code: "CONTENT_POINT_MISSING", message: "知识点正文找不到对应的知识点。", entity_type: "knowledge_point_content", entity_id: id, related_ids: pointId ? [pointId] : undefined });
+    else {
+      const records = contentByPoint.get(pointId) ?? [];
+      records.push(row); contentByPoint.set(pointId, records);
+    }
+    for (const field of CONTENT_FIELDS) {
+      const result = integrityRichDocument(row[field]);
+      if (!result.valid) collector.add({ severity: "ERROR", code: "RICH_CONTENT_INVALID", message: `知识点正文的 ${field} 结构无效：${result.reason ?? "格式错误"}。`, entity_type: "knowledge_point_content", entity_id: id });
+    }
+  }
+  for (const [pointId, records] of contentByPoint) if (records.length > 1) collector.add({ severity: "ERROR", code: "CONTENT_DUPLICATE", message: "同一知识点存在多份正文记录。", entity_type: "knowledge_point", entity_id: pointId, related_ids: records.map((row) => integrityId(row)).filter((id): id is string => Boolean(id)) });
+  for (const [pointId, point] of byId) if (integrityIsActive(point) && (contentByPoint.get(pointId)?.length ?? 0) !== 1) collector.add({ severity: "ERROR", code: "CONTENT_MISSING", message: "活动知识点缺少唯一的正文记录。", entity_type: "knowledge_point", entity_id: pointId });
+  const failed = integrityAnyTableFailed(tables, ["knowledge_points", "knowledge_point_contents"]);
+  return integritySection("knowledge_points", "知识点与正文记录", points.length + contents.length, collector, failed);
+}
+
+function integrityCheckPlacements(tables: IntegrityTables) {
+  const placements = integrityRows(tables, "knowledge_point_placements");
+  const points = new Map(integrityRows(tables, "knowledge_points").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const chapters = new Map(integrityRows(tables, "chapters").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const collector = createIntegrityCollector();
+  const activePairs = new Map<string, string[]>();
+  const activeSorts = new Map<string, string[]>();
+  for (const row of placements) {
+    const id = integrityId(row);
+    const pointId = typeof row.knowledge_point_id === "string" ? row.knowledge_point_id : undefined;
+    const chapterId = typeof row.chapter_id === "string" ? row.chapter_id : undefined;
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "PLACEMENT_ID_INVALID", message: "知识点位置 ID 无效。", entity_type: "placement", entity_id: id });
+    if (!pointId || !points.has(pointId)) collector.add({ severity: "ERROR", code: "PLACEMENT_POINT_MISSING", message: "知识点位置找不到对应的知识点。", entity_type: "placement", entity_id: id, related_ids: pointId ? [pointId] : undefined });
+    if (!chapterId || !chapters.has(chapterId)) collector.add({ severity: "ERROR", code: "PLACEMENT_CHAPTER_MISSING", message: "知识点位置找不到对应的章节。", entity_type: "placement", entity_id: id, related_ids: chapterId ? [chapterId] : undefined });
+    if (!integrityValidSort(row.sort_order)) collector.add({ severity: "ERROR", code: "PLACEMENT_SORT_INVALID", message: "知识点位置排序值无效。", entity_type: "placement", entity_id: id });
+    if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "PLACEMENT_DELETED_AT_INVALID", message: "知识点位置 deleted_at 字段无效。", entity_type: "placement", entity_id: id });
+    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "PLACEMENT_DELETION_BATCH_MISSING", message: "回收站知识点位置缺少删除批次标记。", entity_type: "placement", entity_id: id });
+    if (!integrityValidRevision(row.note_revision)) collector.add({ severity: "ERROR", code: "NOTE_REVISION_INVALID", message: "知识点位置的本章补充版本号无效。", entity_type: "placement", entity_id: id });
+    if (integrityIsActive(row)) {
+      if (pointId && points.has(pointId) && integrityIsDeleted(points.get(pointId)!)) collector.add({ severity: "ERROR", code: "PLACEMENT_POINT_DELETED", message: "活动知识点位置指向了回收站中的知识点。", entity_type: "placement", entity_id: id, related_ids: [pointId] });
+      if (chapterId && chapters.has(chapterId) && integrityIsDeleted(chapters.get(chapterId)!)) collector.add({ severity: "ERROR", code: "PLACEMENT_CHAPTER_DELETED", message: "活动知识点位置指向了回收站中的章节。", entity_type: "placement", entity_id: id, related_ids: [chapterId] });
+      if (pointId && chapterId) {
+        const pair = `${pointId}:${chapterId}`;
+        const pairIds = activePairs.get(pair) ?? [];
+        pairIds.push(id ?? ""); activePairs.set(pair, pairIds);
+        const sortIds = activeSorts.get(chapterId) ?? [];
+        sortIds.push(id ?? ""); activeSorts.set(`${chapterId}:${String(row.sort_order)}`, sortIds);
+      }
+    }
+    const rich = integrityRichDocument(row.chapter_note);
+    if (!rich.valid) collector.add({ severity: "ERROR", code: "CHAPTER_NOTE_INVALID", message: `本章补充结构无效：${rich.reason ?? "格式错误"}。`, entity_type: "placement", entity_id: id });
+  }
+  for (const [pair, ids] of activePairs) if (ids.length > 1) collector.add({ severity: "ERROR", code: "PLACEMENT_DUPLICATE", message: "同一个知识点在同一章节存在重复的活动引用。", entity_type: "placement", related_ids: [pair, ...ids] });
+  const sortGroups = new Map<string, string[]>();
+  for (const row of placements) if (integrityIsActive(row) && typeof row.chapter_id === "string" && integrityId(row)) {
+    const key = `${row.chapter_id}:${String(row.sort_order)}`;
+    const ids = sortGroups.get(key) ?? []; ids.push(integrityId(row)!); sortGroups.set(key, ids);
+  }
+  for (const [key, ids] of sortGroups) if (ids.length > 1) collector.add({ severity: "WARNING", code: "PLACEMENT_SORT_DUPLICATE", message: "同一章节下有多个活动知识点使用相同排序值。", entity_type: "placement_group", related_ids: [key, ...ids] });
+  for (const [pointId, point] of points) if (integrityIsActive(point) && !placements.some((row) => integrityIsActive(row) && row.knowledge_point_id === pointId)) collector.add({ severity: "WARNING", code: "ACTIVE_POINT_ORPHAN", message: "活动知识点没有活动章节引用。", entity_type: "knowledge_point", entity_id: pointId });
+  return integritySection("placements", "章节引用与排序", placements.length, collector, integrityAnyTableFailed(tables, ["knowledge_point_placements", "knowledge_points", "chapters"]));
+}
+
+async function integrityCheckRichText(tables: IntegrityTables) {
+  const contents = integrityRows(tables, "knowledge_point_contents");
+  const placements = integrityRows(tables, "knowledge_point_placements");
+  const pointVersions = integrityRows(tables, "knowledge_point_versions");
+  const noteVersions = integrityRows(tables, "placement_note_versions");
+  const collector = createIntegrityCollector();
+  for (const row of contents) for (const field of CONTENT_FIELDS) {
+    const result = integrityRichDocument(row[field]);
+    if (!result.valid) collector.add({ severity: "ERROR", code: "RICH_CONTENT_INVALID", message: `共享正文 ${field} 结构无效。`, entity_type: "knowledge_point_content", entity_id: integrityId(row) });
+  }
+  for (const row of placements) {
+    const result = integrityRichDocument(row.chapter_note);
+    if (!result.valid) collector.add({ severity: "ERROR", code: "CHAPTER_NOTE_INVALID", message: "本章补充富文本结构无效。", entity_type: "placement", entity_id: integrityId(row) });
+  }
+  for (const row of pointVersions) {
+    const snapshot = integrityHistorySnapshot(row.snapshot);
+    if (!snapshot.valid) collector.add({ severity: "ERROR", code: "HISTORY_SNAPSHOT_INVALID", message: `知识点历史快照无效：${snapshot.reason ?? "格式错误"}。`, entity_type: "knowledge_point_version", entity_id: integrityId(row) });
+  }
+  for (const row of noteVersions) {
+    const snapshot = integrityRichDocument(row.chapter_note_snapshot);
+    if (!snapshot.valid) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_SNAPSHOT_INVALID", message: "本章补充历史快照无效。", entity_type: "placement_note_version", entity_id: integrityId(row) });
+  }
+  return integritySection("rich_text", "富文本与本章补充", contents.length * CONTENT_FIELDS.length + placements.length + pointVersions.length + noteVersions.length, collector, integrityAnyTableFailed(tables, ["knowledge_point_contents", "knowledge_point_placements", "knowledge_point_versions", "placement_note_versions"]));
+}
+
+function integrityCheckTagsAndAccess(tables: IntegrityTables) {
+  const tags = integrityRows(tables, "tags");
+  const relations = integrityRows(tables, "knowledge_point_tags");
+  const favorites = integrityRows(tables, "favorite_items");
+  const pins = integrityRows(tables, "pinned_items");
+  const points = new Map(integrityRows(tables, "knowledge_points").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const chapters = new Map(integrityRows(tables, "chapters").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const tagMap = new Map<string, Record<string, unknown>>();
+  const collector = createIntegrityCollector();
+  const tagNames = new Map<string, string[]>();
+  for (const row of tags) {
+    const id = integrityId(row);
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "TAG_ID_INVALID", message: "标签 ID 无效。", entity_type: "tag", entity_id: id });
+    else tagMap.set(id, row);
+    if (!isTagName(row.name)) collector.add({ severity: "ERROR", code: "TAG_NAME_INVALID", message: "标签名称为空或超过长度限制。", entity_type: "tag", entity_id: id });
+    else { const names = tagNames.get(row.name) ?? []; names.push(id ?? ""); tagNames.set(row.name, names); }
+  }
+  for (const [name, ids] of tagNames) if (ids.length > 1) collector.add({ severity: "ERROR", code: "TAG_NAME_DUPLICATE", message: `标签名称“${name}”重复。`, entity_type: "tag", related_ids: ids });
+  const relationSet = new Set<string>();
+  for (const row of relations) {
+    const pointId = typeof row.knowledge_point_id === "string" ? row.knowledge_point_id : undefined;
+    const tagId = typeof row.tag_id === "string" ? row.tag_id : undefined;
+    const key = `${pointId ?? ""}:${tagId ?? ""}`;
+    if (relationSet.has(key)) collector.add({ severity: "ERROR", code: "TAG_RELATION_DUPLICATE", message: "知识点标签关系重复。", entity_type: "knowledge_point_tag", related_ids: [pointId ?? "", tagId ?? ""] });
+    relationSet.add(key);
+    if (!pointId || !points.has(pointId)) collector.add({ severity: "ERROR", code: "TAG_POINT_MISSING", message: "标签关系找不到对应的知识点。", entity_type: "knowledge_point_tag", related_ids: pointId ? [pointId] : undefined });
+    if (!tagId || !tagMap.has(tagId)) collector.add({ severity: "ERROR", code: "TAG_MISSING", message: "标签关系找不到对应的标签。", entity_type: "knowledge_point_tag", related_ids: tagId ? [tagId] : undefined });
+  }
+  const favoriteSet = new Set<string>();
+  for (const row of favorites) {
+    const pointId = typeof row.knowledge_point_id === "string" ? row.knowledge_point_id : undefined;
+    if (pointId && favoriteSet.has(pointId)) collector.add({ severity: "ERROR", code: "FAVORITE_DUPLICATE", message: "知识点收藏关系重复。", entity_type: "favorite", entity_id: pointId });
+    if (pointId) favoriteSet.add(pointId);
+    if (!pointId || !points.has(pointId)) collector.add({ severity: "ERROR", code: "FAVORITE_POINT_MISSING", message: "收藏关系找不到对应的知识点。", entity_type: "favorite", entity_id: pointId });
+  }
+  const pinSet = new Set<string>();
+  let activePinCount = 0;
+  const pinSorts = new Map<number, string[]>();
+  for (const row of pins) {
+    const id = integrityId(row);
+    const itemType = row.item_type;
+    const itemId = typeof row.item_id === "string" ? row.item_id : undefined;
+    const key = `${String(itemType)}:${itemId ?? ""}`;
+    if (pinSet.has(key)) collector.add({ severity: "ERROR", code: "PIN_DUPLICATE", message: "置顶关系重复。", entity_type: "pin", entity_id: id, related_ids: itemId ? [itemId] : undefined });
+    pinSet.add(key);
+    const target = itemType === "chapter" ? chapters.get(itemId) : itemType === "knowledge_point" ? points.get(itemId) : undefined;
+    if (itemType !== "chapter" && itemType !== "knowledge_point") collector.add({ severity: "ERROR", code: "PIN_TYPE_INVALID", message: "置顶项目类型无效。", entity_type: "pin", entity_id: id });
+    else if (!itemId || !target) collector.add({ severity: "ERROR", code: "PIN_TARGET_MISSING", message: "置顶项目找不到对应的章节或知识点。", entity_type: "pin", entity_id: id, related_ids: itemId ? [itemId] : undefined });
+    else if (integrityIsActive(target)) { activePinCount += 1; if (integrityValidSort(row.sort_order)) { const ids = pinSorts.get(row.sort_order) ?? []; ids.push(id ?? ""); pinSorts.set(row.sort_order, ids); } }
+    if (!integrityValidSort(row.sort_order)) collector.add({ severity: "ERROR", code: "PIN_SORT_INVALID", message: "置顶项目排序值无效。", entity_type: "pin", entity_id: id });
+  }
+  if (activePinCount > 4) collector.add({ severity: "ERROR", code: "PIN_LIMIT_EXCEEDED", message: `当前有 ${activePinCount} 个活动置顶项目，超过 4 个上限。`, entity_type: "pin_group" });
+  for (const [sort, ids] of pinSorts) if (ids.length > 1) collector.add({ severity: "WARNING", code: "PIN_SORT_DUPLICATE", message: `活动置顶项目排序值 ${sort} 重复。`, entity_type: "pin_group", related_ids: ids });
+  return integritySection("tags_access", "标签、收藏与置顶", tags.length + relations.length + favorites.length + pins.length, collector, integrityAnyTableFailed(tables, ["tags", "knowledge_point_tags", "favorite_items", "pinned_items", "knowledge_points", "chapters"]));
+}
+
+async function integrityCheckHistory(tables: IntegrityTables) {
+  const pointVersions = integrityRows(tables, "knowledge_point_versions");
+  const noteVersions = integrityRows(tables, "placement_note_versions");
+  const points = new Map(integrityRows(tables, "knowledge_points").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const placements = new Map(integrityRows(tables, "knowledge_point_placements").map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  const collector = createIntegrityCollector();
+  const pointHashes = new Set<string>();
+  for (const row of pointVersions) {
+    const id = integrityId(row);
+    const pointId = typeof row.knowledge_point_id === "string" ? row.knowledge_point_id : undefined;
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "HISTORY_ID_INVALID", message: "知识点历史版本 ID 无效。", entity_type: "knowledge_point_version", entity_id: id });
+    if (!pointId || !points.has(pointId)) collector.add({ severity: "ERROR", code: "HISTORY_POINT_MISSING", message: "知识点历史版本找不到所属知识点。", entity_type: "knowledge_point_version", entity_id: id, related_ids: pointId ? [pointId] : undefined });
+    const hash = typeof row.content_hash === "string" ? row.content_hash : "";
+    const hashKey = `${pointId ?? ""}:${hash}`;
+    if (pointHashes.has(hashKey)) collector.add({ severity: "ERROR", code: "HISTORY_DUPLICATE", message: "知识点历史版本内容哈希重复。", entity_type: "knowledge_point_version", entity_id: id });
+    pointHashes.add(hashKey);
+    const snapshot = integrityHistorySnapshot(row.snapshot);
+    if (!snapshot.valid) collector.add({ severity: "ERROR", code: "HISTORY_SNAPSHOT_INVALID", message: `知识点历史快照无效：${snapshot.reason ?? "格式错误"}。`, entity_type: "knowledge_point_version", entity_id: id });
+    if (!integrityValidDate(row.created_at)) collector.add({ severity: "ERROR", code: "HISTORY_TIMESTAMP_INVALID", message: "知识点历史版本时间无效。", entity_type: "knowledge_point_version", entity_id: id });
+    if (!await integrityHashMatches(row.snapshot, row.content_hash)) collector.add({ severity: "ERROR", code: "HISTORY_HASH_INVALID", message: "知识点历史版本哈希校验失败。", entity_type: "knowledge_point_version", entity_id: id });
+  }
+  const noteHashes = new Set<string>();
+  for (const row of noteVersions) {
+    const id = integrityId(row);
+    const placementId = typeof row.placement_id === "string" ? row.placement_id : undefined;
+    if (!id || !isUuid(id)) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_ID_INVALID", message: "本章补充历史版本 ID 无效。", entity_type: "placement_note_version", entity_id: id });
+    if (!placementId || !placements.has(placementId)) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_PARENT_MISSING", message: "本章补充历史版本找不到所属引用位置。", entity_type: "placement_note_version", entity_id: id, related_ids: placementId ? [placementId] : undefined });
+    const hash = typeof row.content_hash === "string" ? row.content_hash : "";
+    const hashKey = `${placementId ?? ""}:${hash}`;
+    if (noteHashes.has(hashKey)) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_DUPLICATE", message: "本章补充历史版本内容哈希重复。", entity_type: "placement_note_version", entity_id: id });
+    noteHashes.add(hashKey);
+    const snapshot = integrityRichDocument(row.chapter_note_snapshot);
+    if (!snapshot.valid) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_SNAPSHOT_INVALID", message: "本章补充历史快照无效。", entity_type: "placement_note_version", entity_id: id });
+    if (!integrityValidDate(row.created_at)) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_TIMESTAMP_INVALID", message: "本章补充历史版本时间无效。", entity_type: "placement_note_version", entity_id: id });
+    if (!await integrityHashMatches(row.chapter_note_snapshot, row.content_hash)) collector.add({ severity: "ERROR", code: "PLACEMENT_HISTORY_HASH_INVALID", message: "本章补充历史版本哈希校验失败。", entity_type: "placement_note_version", entity_id: id });
+  }
+  return integritySection("history", "历史版本", pointVersions.length + noteVersions.length, collector, integrityAnyTableFailed(tables, ["knowledge_point_versions", "placement_note_versions", "knowledge_points", "knowledge_point_placements"]));
+}
+
+function integrityCheckRecycleAndRevisions(tables: IntegrityTables) {
+  const chapters = integrityRows(tables, "chapters");
+  const points = integrityRows(tables, "knowledge_points");
+  const placements = integrityRows(tables, "knowledge_point_placements");
+  const collector = createIntegrityCollector();
+  for (const row of [...chapters, ...points, ...placements]) {
+    if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "DELETED_AT_INVALID", message: "回收站状态的 deleted_at 字段无效。", entity_type: "recycle_item", entity_id: integrityId(row) });
+    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "DELETION_BATCH_MISSING", message: "回收站项目缺少删除批次标记。", entity_type: "recycle_item", entity_id: integrityId(row) });
+    if (integrityIsActive(row) && row.deletion_batch_id !== null) collector.add({ severity: "WARNING", code: "ACTIVE_DELETION_BATCH", message: "活动数据仍保留删除批次标记，请留意恢复状态。", entity_type: "recycle_item", entity_id: integrityId(row) });
+  }
+  const chapterMap = new Map(chapters.map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
+  for (const row of chapters) if (integrityIsActive(row) && typeof row.parent_id === "string" && integrityIsDeleted(chapterMap.get(row.parent_id) ?? {})) collector.add({ severity: "ERROR", code: "ACTIVE_CHILD_OF_DELETED", message: "活动章节挂在回收站章节下面。", entity_type: "chapter", entity_id: integrityId(row), related_ids: [row.parent_id] });
+  for (const row of points) if (integrityIsDeleted(row) && placements.some((placement) => integrityIsActive(placement) && placement.knowledge_point_id === row.id)) collector.add({ severity: "ERROR", code: "DELETED_POINT_HAS_ACTIVE_PLACEMENT", message: "回收站知识点仍有活动章节引用。", entity_type: "knowledge_point", entity_id: integrityId(row) });
+  return {
+    recycle: integritySection("recycle", "回收站与软删除", chapters.length + points.length + placements.length, collector, integrityAnyTableFailed(tables, ["chapters", "knowledge_points", "knowledge_point_placements"])),
+  };
+}
+
+function integrityCheckRevisions(tables: IntegrityTables) {
+  const chapters = integrityRows(tables, "chapters");
+  const points = integrityRows(tables, "knowledge_points");
+  const placements = integrityRows(tables, "knowledge_point_placements");
+  const collector = createIntegrityCollector();
+  for (const row of chapters) if (!integrityValidRevision(row.overview_revision)) collector.add({ severity: "ERROR", code: "OVERVIEW_REVISION_INVALID", message: "章节 overview_revision 无效。", entity_type: "chapter", entity_id: integrityId(row) });
+  for (const row of points) if (!integrityValidRevision(row.core_revision)) collector.add({ severity: "ERROR", code: "CORE_REVISION_INVALID", message: "知识点 core_revision 无效。", entity_type: "knowledge_point", entity_id: integrityId(row) });
+  for (const row of placements) if (!integrityValidRevision(row.note_revision)) collector.add({ severity: "ERROR", code: "NOTE_REVISION_INVALID", message: "引用位置 note_revision 无效。", entity_type: "placement", entity_id: integrityId(row) });
+  return integritySection("revisions", "编辑版本号", chapters.length + points.length + placements.length, collector, integrityAnyTableFailed(tables, ["chapters", "knowledge_points", "knowledge_point_placements"]));
+}
+
+function integrityStatusLabel(status: IntegrityReport["status"] | IntegritySectionStatus) {
+  return status === "PASS" ? "通过" : status === "WARNING" ? "有警告" : status === "ERROR" ? "发现错误" : "检查未完整完成";
+}
+
+function buildIntegrityReportText(report: Omit<IntegrityReport, "report_text">) {
+  const lines = [
+    "悠扬讲义｜系统完整性检查报告",
+    `检查时间：${report.checked_at}`,
+    `检查范围：${report.schema_version} / Backup Format ${report.backup_format_version}`,
+    `总体状态：${integrityStatusLabel(report.status)}`,
+    "",
+  ];
+  for (const section of report.sections) {
+    lines.push(`【${section.label}】${integrityStatusLabel(section.status)}：${section.summary}`);
+    for (const issue of section.issues) {
+      const entity = issue.entity_id ? `（${issue.entity_type ?? "记录"} ${issue.entity_id}）` : "";
+      lines.push(`- [${issue.severity}] ${issue.message}${entity}`);
+    }
+    if (section.truncated_issue_count > 0) lines.push(`- 另有 ${section.truncated_issue_count} 条同类问题未在报告中展开。`);
+  }
+  return lines.join("\n");
+}
+
+async function runIntegrityCheck(client: SupabaseClient): Promise<IntegrityReport> {
+  const tables = await readIntegrityTables(client);
+  const sections = [
+    integrityCheckChapters(tables),
+    integrityCheckKnowledgePoints(tables),
+    integrityCheckPlacements(tables),
+    await integrityCheckRichText(tables),
+    integrityCheckTagsAndAccess(tables),
+    await integrityCheckHistory(tables),
+    integrityCheckRecycleAndRevisions(tables).recycle,
+    integrityCheckRevisions(tables),
+    integritySection("backup_search", "备份与搜索基础", BACKUP_TABLES.reduce((count, table) => count + integrityRows(tables, table).length, 0), createIntegrityCollector(), BACKUP_TABLES.some((table) => integrityTableFailed(tables, table))),
+  ];
+  const status = sections.some((section) => section.status === "CHECK_FAILED")
+    ? "CHECK_FAILED"
+    : sections.some((section) => section.status === "ERROR")
+      ? "ERROR"
+      : sections.some((section) => section.status === "WARNING")
+        ? "WARNING"
+        : "PASS";
+  const checked_at = new Date().toISOString();
+  const reportWithoutText = {
+    status,
+    checked_at,
+    schema_version: "0016",
+    backup_format_version: BACKUP_FORMAT_VERSION,
+    issue_count: sections.reduce((total, section) => total + section.issue_count, 0),
+    summary: status === "CHECK_FAILED"
+      ? "检查未完整完成，部分数据未能读取。"
+      : status === "ERROR"
+        ? "发现需要处理的数据完整性错误。"
+        : status === "WARNING"
+          ? "检查完成，但有部分数据需要留意。"
+          : "检查完成，未发现完整性问题。",
+    sections,
+  } as Omit<IntegrityReport, "report_text">;
+  return { ...reportWithoutText, report_text: buildIntegrityReportText(reportWithoutText) };
+}
+
 async function readCurrentPointSnapshot(client: SupabaseClient, pointId: string, includeDeleted = false) {
   const pointQuery = client
     .from("knowledge_points")
@@ -1732,6 +2298,14 @@ async function handleNote(request: Request, client: SupabaseClient) {
 }
 
 async function handlePhase2(request: Request, client: SupabaseClient, resource: string) {
+  if (request.method === "POST" && resource === "integrity_check") {
+    try {
+      return json(request, 200, { ok: true, report: await runIntegrityCheck(client) });
+    } catch (error) {
+      return databaseError(request, error, "系统检查未完整完成，请稍后重试。");
+    }
+  }
+
   if (request.method === "GET" && resource === "backup") {
     try {
       return json(request, 200, { ok: true, backup: await buildFullBackup(client) });

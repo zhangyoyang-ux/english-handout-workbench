@@ -265,6 +265,34 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
 .backup-confirm { margin-top: 18px; padding: 18px; border: 1px solid #ead7c1; border-radius: var(--ui-radius-md); background: #fffaf2; }
 .backup-confirm p + p { margin-top: 7px; }
 .backup-confirm__actions { align-items: center; justify-content: flex-end; margin-top: 18px; }
+.integrity-launch { border-top-color: var(--ui-teal-border); }
+.integrity-report { margin-top: 12px; padding: 18px; border: 1px solid var(--ui-border); border-radius: var(--ui-radius-md); background: var(--ui-surface-muted); }
+.integrity-report--pass { border-color: var(--ui-success); background: var(--ui-success-soft); }
+.integrity-report--warning { border-color: #ead9bd; background: var(--ui-pending-soft); }
+.integrity-report--error, .integrity-report--check_failed { border-color: #edcfcf; background: #fff8f8; }
+.integrity-report__header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--ui-space-4); }
+.integrity-report__status { display: inline-block; margin-bottom: 7px; color: var(--ui-success); font-size: 12px; font-weight: 700; }
+.integrity-report--warning .integrity-report__status { color: var(--ui-pending); }
+.integrity-report--error .integrity-report__status, .integrity-report--check_failed .integrity-report__status { color: var(--ui-danger); }
+.integrity-report h3 { margin: 0 0 5px; color: var(--ui-text); font-size: 15px; }
+.integrity-report p { margin: 0; color: var(--ui-text-secondary); font-size: 12px; line-height: 1.7; }
+.integrity-report__summary { margin: 14px 0 !important; color: var(--ui-text) !important; font-weight: 600; }
+.integrity-report__sections { display: grid; gap: 7px; }
+.integrity-section { border: 1px solid var(--ui-border-soft); border-radius: var(--ui-radius-sm); background: rgba(255,255,255,.75); }
+.integrity-section summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; cursor: pointer; list-style: none; }
+.integrity-section summary::-webkit-details-marker { display: none; }
+.integrity-section summary > span { display: grid; gap: 3px; min-width: 0; }
+.integrity-section summary strong { color: var(--ui-text); font-size: 12px; }
+.integrity-section summary small { color: var(--ui-text-secondary); font-size: 11px; line-height: 1.5; }
+.integrity-section summary em { flex: 0 0 auto; color: var(--ui-success); font-size: 11px; font-style: normal; }
+.integrity-section--warning summary em { color: var(--ui-pending); }
+.integrity-section--error summary em, .integrity-section--check_failed summary em { color: var(--ui-danger); }
+.integrity-section ul { display: grid; gap: 6px; margin: 0; padding: 0 12px 12px 28px; color: var(--ui-text-secondary); font-size: 11px; line-height: 1.6; }
+.integrity-section li::marker { color: var(--ui-text-tertiary); }
+.integrity-issue__severity { display: inline-block; min-width: 28px; margin-right: 6px; font-size: 10px; font-weight: 700; }
+.integrity-issue__severity--error { color: var(--ui-danger); }
+.integrity-issue__severity--warning { color: var(--ui-pending); }
+.integrity-section__more { padding: 0 12px 12px 28px; color: var(--ui-danger) !important; font-size: 11px !important; }
 .conflict-overlay { position: fixed; z-index: 70; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(28,28,30,.22); }
 .conflict-surface { width: min(100%, 480px); padding: 28px; border: 1px solid #ead7c1; border-radius: var(--ui-radius-lg); background: var(--ui-surface); box-shadow: 0 18px 50px rgba(28,28,30,.16); }
 .conflict-surface__icon { display: grid; width: 30px; height: 30px; margin-bottom: 18px; place-items: center; border-radius: 50%; background: #fff1d9; color: #9a6b2e; font-weight: 700; }
@@ -281,6 +309,9 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
   .backup-summary ul { grid-template-columns: 1fr; }
   .backup-summary__heading { display: block; }
   .backup-summary__checksum { display: block; margin-top: 6px; }
+  .integrity-report__header { display: block; }
+  .integrity-report__header .secondary-button { width: 100%; margin-top: 13px; }
+  .integrity-section summary { align-items: flex-start; }
   .conflict-overlay { align-items: end; padding: 0; }
   .conflict-surface { width: 100%; padding: 24px 18px calc(24px + env(safe-area-inset-bottom)); border-radius: 18px 18px 0 0; }
   .conflict-surface__actions { justify-content: stretch; }

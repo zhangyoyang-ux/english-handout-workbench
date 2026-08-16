@@ -178,6 +178,37 @@ type FullBackup = {
   };
   data: FullBackupData;
 };
+type IntegrityIssue = {
+  severity: "WARNING" | "ERROR";
+  code: string;
+  message: string;
+  entity_type?: string;
+  entity_id?: string;
+  related_ids?: string[];
+};
+type IntegritySection = {
+  key: string;
+  label: string;
+  status: "PASS" | "WARNING" | "ERROR" | "CHECK_FAILED";
+  summary: string;
+  checked: number;
+  issue_count: number;
+  error_count: number;
+  warning_count: number;
+  displayed_issue_count: number;
+  truncated_issue_count: number;
+  issues: IntegrityIssue[];
+};
+type IntegrityReport = {
+  status: "PASS" | "WARNING" | "ERROR" | "CHECK_FAILED";
+  checked_at: string;
+  schema_version: string;
+  backup_format_version: 1;
+  issue_count: number;
+  summary: string;
+  sections: IntegritySection[];
+  report_text: string;
+};
 type SaveFilePickerWindow = Window & {
   showSaveFilePicker?: (options: {
     suggestedName: string;
@@ -192,6 +223,7 @@ const NOTES_FUNCTION_URL = import.meta.env.VITE_NOTES_FUNCTION_URL ?? "https://d
 const CONTENT_DRAFT_PREFIX = "english-handout-workbench:phase3:content:";
 const CHAPTER_NOTE_DRAFT_PREFIX = "english-handout-workbench:phase4:chapter-note:";
 const LAST_FULL_BACKUP_KEY = "last_full_backup_at";
+const LAST_INTEGRITY_CHECK_KEY = "last_integrity_check_at";
 const MAX_BACKUP_BYTES = 25_000_000;
 const BACKUP_TABLES: BackupTableName[] = ["stage1_notes", "workbench_initialization", "chapters", "knowledge_points", "knowledge_point_contents", "knowledge_point_placements", "tags", "knowledge_point_tags", "favorite_items", "pinned_items", "knowledge_point_versions", "placement_note_versions"];
 const CONTENT_SECTIONS: ContentSection[] = ["explanation", "exercises", "supplement", "inspiration"];
@@ -280,6 +312,9 @@ function backupSummary(backup: FullBackup) {
 }
 function formatBackupTime(value: string) {
   try { return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); } catch { return value; }
+}
+function integrityStatusLabel(status: IntegrityReport["status"] | IntegritySection["status"]) {
+  return status === "PASS" ? "通过" : status === "WARNING" ? "有警告" : status === "ERROR" ? "发现错误" : "检查未完整完成";
 }
 
 function endpoint(resource: string, params: Record<string, string> = {}) {
@@ -498,6 +533,11 @@ function App() {
   const [backupConfirmOpen, setBackupConfirmOpen] = useState(false);
   const [backupRestoring, setBackupRestoring] = useState(false);
   const [lastFullBackupAt, setLastFullBackupAt] = useState(() => localStorage.getItem(LAST_FULL_BACKUP_KEY) ?? "");
+  const [integrityBusy, setIntegrityBusy] = useState(false);
+  const [integrityError, setIntegrityError] = useState("");
+  const [integrityNotice, setIntegrityNotice] = useState("");
+  const [integrityReport, setIntegrityReport] = useState<IntegrityReport | null>(null);
+  const [lastIntegrityCheckAt, setLastIntegrityCheckAt] = useState(() => localStorage.getItem(LAST_INTEGRITY_CHECK_KEY) ?? "");
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const pendingCoreMetadataRef = useRef<Partial<Pick<KnowledgePoint, "title" | "status">>>({});
@@ -637,6 +677,33 @@ function App() {
     setDataSecurityOpen(true);
     setBackupError("");
     setBackupNotice("");
+    setIntegrityError("");
+    setIntegrityNotice("");
+  };
+
+  const runIntegrityCheck = async () => {
+    setIntegrityBusy(true); setIntegrityError(""); setIntegrityNotice("");
+    try {
+      const result = await requestJson<{ ok: true; report: IntegrityReport }>(endpoint("integrity_check"), { method: "POST" });
+      setIntegrityReport(result.report);
+      const checkedAt = result.report.checked_at;
+      localStorage.setItem(LAST_INTEGRITY_CHECK_KEY, checkedAt);
+      setLastIntegrityCheckAt(checkedAt);
+      setIntegrityNotice(result.report.status === "CHECK_FAILED" ? "检查未完整完成，请查看报告中的失败项目。" : "系统检查已完成。请根据结果处理错误或警告。");
+    } catch (error) {
+      setIntegrityReport(null);
+      setIntegrityError(error instanceof Error ? error.message : "系统检查未完整完成，请稍后重试。");
+    } finally { setIntegrityBusy(false); }
+  };
+
+  const copyIntegrityReport = async () => {
+    if (!integrityReport) return;
+    try {
+      await navigator.clipboard.writeText(integrityReport.report_text);
+      setIntegrityNotice("检查报告已复制。");
+    } catch {
+      setIntegrityError("复制失败，请稍后重试。");
+    }
   };
 
   const exportFullBackup = async () => {
@@ -1841,12 +1908,16 @@ function App() {
 
   const renderDataSecurity = () => {
     if (!dataSecurityOpen) return null;
-    return <div className="backup-overlay" role="presentation" onClick={() => { if (!backupBusy && !backupRestoring && !backupConfirmOpen) setDataSecurityOpen(false); }}>
+    return <div className="backup-overlay" role="presentation" onClick={() => { if (!backupBusy && !backupRestoring && !backupConfirmOpen && !integrityBusy) setDataSecurityOpen(false); }}>
       <section className="backup-surface" role="dialog" aria-modal="true" aria-labelledby="backup-title" onClick={(event) => event.stopPropagation()}>
-        <header className="backup-surface__header"><div><p className="content-kicker">低频安全工具</p><h2 id="backup-title">数据与安全</h2></div><button type="button" className="quiet-button" onClick={() => setDataSecurityOpen(false)} disabled={backupBusy || backupRestoring}>关闭</button></header>
+        <header className="backup-surface__header"><div><p className="content-kicker">低频安全工具</p><h2 id="backup-title">数据与安全</h2></div><button type="button" className="quiet-button" onClick={() => setDataSecurityOpen(false)} disabled={backupBusy || backupRestoring || integrityBusy}>关闭</button></header>
         <p className="backup-surface__intro">完整备份会包含章节、知识点、引用关系、标签、历史版本和回收站数据，不包含任何密钥或浏览器临时草稿。</p>
         {backupError && <div className="backup-alert backup-alert--error" role="alert">{backupError}</div>}
         {backupNotice && <div className="backup-alert backup-alert--success" role="status">{backupNotice}</div>}
+        {integrityError && <div className="backup-alert backup-alert--error" role="alert">{integrityError}</div>}
+        {integrityNotice && <div className="backup-alert backup-alert--success" role="status">{integrityNotice}</div>}
+        <section className="backup-section integrity-launch"><div><h3>系统检查</h3><p>只读取章节、知识点、引用、正文、标签、历史版本和回收站关系，不会自动修改任何数据。</p>{lastIntegrityCheckAt && <small>上次系统检查：{formatBackupTime(lastIntegrityCheckAt)}</small>}</div><button type="button" className="primary-button" disabled={backupBusy || backupRestoring || integrityBusy} onClick={() => void runIntegrityCheck()}>{integrityBusy ? "正在检查……" : "开始检查"}</button></section>
+        {integrityReport && <section className={`integrity-report integrity-report--${integrityReport.status.toLowerCase()}`} aria-live="polite"><div className="integrity-report__header"><div><span className="integrity-report__status">{integrityStatusLabel(integrityReport.status)}</span><h3>检查结果</h3><p>检查时间：{formatBackupTime(integrityReport.checked_at)} · Schema {integrityReport.schema_version}</p></div><button type="button" className="secondary-button" onClick={() => void copyIntegrityReport()}>复制报告</button></div><p className="integrity-report__summary">{integrityReport.summary}</p><div className="integrity-report__sections">{integrityReport.sections.map((section) => <details key={section.key} className={`integrity-section integrity-section--${section.status.toLowerCase()}`} open={section.status !== "PASS"}><summary><span><strong>{section.label}</strong><small>{section.summary}</small></span><em>{integrityStatusLabel(section.status)}</em></summary>{section.issues.length > 0 && <ul>{section.issues.map((issue, index) => <li key={`${issue.code}-${issue.entity_id ?? ""}-${index}`}><span className={`integrity-issue__severity integrity-issue__severity--${issue.severity.toLowerCase()}`}>{issue.severity === "ERROR" ? "错误" : "警告"}</span>{issue.message}</li>)}</ul>}{section.truncated_issue_count > 0 && <p className="integrity-section__more">还有 {section.truncated_issue_count} 条同类问题未展开，请复制完整报告查看。</p>}</details>)}</div></section>}
         <section className="backup-section"><div><h3>完整备份</h3><p>将悠扬讲义的全部业务数据导出为一个 UTF-8 JSON 文件。</p>{lastFullBackupAt && <small>上次完整备份：{formatBackupTime(lastFullBackupAt)}</small>}</div><button type="button" className="primary-button" disabled={backupBusy || backupRestoring} onClick={() => void exportFullBackup()}>{backupBusy ? "正在处理……" : "导出完整备份"}</button></section>
         <section className="backup-section"><div><h3>从备份恢复</h3><p>选择备份文件后，系统会先校验并预检，确认后才会写入数据库。</p></div><label className="secondary-button backup-file-button"><input type="file" accept=".json,application/json" onChange={(event) => void handleBackupFile(event)} disabled={backupBusy || backupRestoring} />选择备份文件</label></section>
         {backupCandidate && backupPreflight && <section className="backup-summary"><div className="backup-summary__heading"><div><span className="backup-summary__status">✓ 备份有效</span><h3>恢复摘要</h3><p>备份时间：{formatBackupTime(backupCandidate.manifest.created_at)}</p></div><span className="backup-summary__checksum">完整性校验通过</span></div><ul>{backupSummary(backupCandidate).map((item) => <li key={item}>{item}</li>)}</ul><button type="button" className="secondary-button" disabled={backupBusy || backupRestoring} onClick={() => void prepareBackupRestore()}>{backupBusy ? "正在生成安全备份……" : "恢复此备份"}</button></section>}
