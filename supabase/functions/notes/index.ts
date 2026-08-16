@@ -211,6 +211,9 @@ const BACKUP_TABLES: BackupTableName[] = [
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUS_VALUES = new Set(["draft", "needs_improvement", "organized"]);
 const CONTENT_FIELDS = ["explanation", "exercises", "supplement", "inspiration"] as const;
+// 0007 introduced deletion batches after the two known formal placement deletions.
+// Keep the historical deletion timestamp as-is instead of inventing a batch ID.
+const PHASE8_DELETION_BATCH_INTRODUCED_AT = "2026-08-16T07:31:30.000Z";
 
 const allowedOrigins = new Set([
   "https://zhangyoyang-ux.github.io",
@@ -331,6 +334,19 @@ async function hashJson(value: unknown) {
   const encoded = new TextEncoder().encode(JSON.stringify(value));
   const digest = await crypto.subtle.digest("SHA-256", encoded);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hashLegacyHistorySnapshot(value: unknown) {
+  if (!isHistorySnapshot(value)) return null;
+  const snapshot = value as Record<string, unknown>;
+  const content = snapshot.content as Record<string, unknown>;
+  const legacyContent = {
+    explanation: content.explanation,
+    exercises: content.exercises,
+    supplement: content.supplement,
+    inspiration: content.inspiration,
+  };
+  return hashJson({ title: snapshot.title, status: snapshot.status, content: legacyContent });
 }
 
 function stableJsonValue(value: unknown): unknown {
@@ -526,6 +542,7 @@ type IntegritySection = {
   issue_count: number;
   error_count: number;
   warning_count: number;
+  legacy_count: number;
   displayed_issue_count: number;
   truncated_issue_count: number;
   issues: IntegrityIssue[];
@@ -536,6 +553,7 @@ type IntegrityReport = {
   schema_version: string;
   backup_format_version: 1;
   issue_count: number;
+  legacy_count: number;
   summary: string;
   sections: IntegritySection[];
   report_text: string;
@@ -560,13 +578,15 @@ function createIntegrityCollector() {
   let issueCount = 0;
   let errorCount = 0;
   let warningCount = 0;
+  let legacyCount = 0;
   const add = (issue: IntegrityIssue) => {
     issueCount += 1;
     if (issue.severity === "ERROR") errorCount += 1;
     else warningCount += 1;
     if (issues.length < INTEGRITY_ISSUE_DISPLAY_LIMIT) issues.push(issue);
   };
-  return { issues, add, get issueCount() { return issueCount; }, get errorCount() { return errorCount; }, get warningCount() { return warningCount; } };
+  const addLegacy = () => { legacyCount += 1; };
+  return { issues, add, addLegacy, get issueCount() { return issueCount; }, get errorCount() { return errorCount; }, get warningCount() { return warningCount; }, get legacyCount() { return legacyCount; } };
 }
 
 function integritySection(
@@ -599,6 +619,7 @@ function integritySection(
     issue_count: collector.issueCount,
     error_count: collector.errorCount,
     warning_count: collector.warningCount,
+    legacy_count: collector.legacyCount,
     displayed_issue_count: collector.issues.length,
     truncated_issue_count: Math.max(0, collector.issueCount - collector.issues.length),
     issues: collector.issues,
@@ -714,6 +735,25 @@ async function integrityHashMatches(value: unknown, storedHash: unknown) {
   return typeof storedHash === "string" && /^[0-9a-f]{64}$/i.test(storedHash) && storedHash.toLowerCase() === (await hashJson(value)).toLowerCase();
 }
 
+async function integrityHistoryHashStatus(value: unknown, storedHash: unknown): Promise<"CURRENT" | "LEGACY" | "INVALID"> {
+  if (typeof storedHash !== "string" || !/^[0-9a-f]{64}$/i.test(storedHash)) return "INVALID";
+  if (await integrityHashMatches(value, storedHash)) return "CURRENT";
+  const legacyHash = await hashLegacyHistorySnapshot(value);
+  return legacyHash && legacyHash.toLowerCase() === storedHash.toLowerCase() ? "LEGACY" : "INVALID";
+}
+
+function integrityIsLegacyDeletedWithoutBatch(row: Record<string, unknown>) {
+  return integrityIsDeleted(row)
+    && row.deletion_batch_id === null
+    && typeof row.deleted_at === "string"
+    && Number.isFinite(Date.parse(row.deleted_at))
+    && Date.parse(row.deleted_at) < Date.parse(PHASE8_DELETION_BATCH_INTRODUCED_AT);
+}
+
+function integrityIsMissingDeletionBatch(row: Record<string, unknown>) {
+  return integrityIsDeleted(row) && row.deletion_batch_id === null && !integrityIsLegacyDeletedWithoutBatch(row);
+}
+
 function integrityCheckChapters(tables: IntegrityTables) {
   const rows = integrityRows(tables, "chapters");
   const collector = createIntegrityCollector();
@@ -728,7 +768,8 @@ function integrityCheckChapters(tables: IntegrityTables) {
     if (!integrityValidSort(row.sort_order)) collector.add({ severity: "ERROR", code: "CHAPTER_SORT_INVALID", message: "章节排序值无效。", entity_type: "chapter", entity_id: id });
     if (!integrityValidDate(row.created_at) || !integrityValidDate(row.updated_at)) collector.add({ severity: "ERROR", code: "CHAPTER_TIMESTAMP_INVALID", message: "章节时间字段无效。", entity_type: "chapter", entity_id: id });
     if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "CHAPTER_DELETED_AT_INVALID", message: "章节 deleted_at 字段无效。", entity_type: "chapter", entity_id: id });
-    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "CHAPTER_DELETION_BATCH_MISSING", message: "回收站章节缺少删除批次标记。", entity_type: "chapter", entity_id: id });
+    if (integrityIsLegacyDeletedWithoutBatch(row)) collector.addLegacy();
+    else if (integrityIsMissingDeletionBatch(row)) collector.add({ severity: "ERROR", code: "CHAPTER_DELETION_BATCH_MISSING", message: "回收站章节缺少删除批次标记。", entity_type: "chapter", entity_id: id });
     if (integrityIsActive(row)) {
       const parentId = row.parent_id === null ? null : typeof row.parent_id === "string" ? row.parent_id : undefined;
       const siblingKey = parentId ?? "__root__";
@@ -794,7 +835,8 @@ function integrityCheckKnowledgePoints(tables: IntegrityTables) {
     if (typeof row.status !== "string" || !STATUS_VALUES.has(row.status)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_STATUS_INVALID", message: "知识点状态无效。", entity_type: "knowledge_point", entity_id: id });
     if (!integrityValidDate(row.created_at) || !integrityValidDate(row.updated_at)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_TIMESTAMP_INVALID", message: "知识点时间字段无效。", entity_type: "knowledge_point", entity_id: id });
     if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_DELETED_AT_INVALID", message: "知识点 deleted_at 字段无效。", entity_type: "knowledge_point", entity_id: id });
-    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "KNOWLEDGE_POINT_DELETION_BATCH_MISSING", message: "回收站知识点缺少删除批次标记。", entity_type: "knowledge_point", entity_id: id });
+    if (integrityIsLegacyDeletedWithoutBatch(row)) collector.addLegacy();
+    else if (integrityIsMissingDeletionBatch(row)) collector.add({ severity: "ERROR", code: "KNOWLEDGE_POINT_DELETION_BATCH_MISSING", message: "回收站知识点缺少删除批次标记。", entity_type: "knowledge_point", entity_id: id });
     if (integrityIsActive(row) && !integrityValidRevision(row.core_revision)) collector.add({ severity: "ERROR", code: "CORE_REVISION_INVALID", message: "活动知识点的版本号无效。", entity_type: "knowledge_point", entity_id: id });
   }
   for (const row of contents) {
@@ -833,7 +875,8 @@ function integrityCheckPlacements(tables: IntegrityTables) {
     if (!chapterId || !chapters.has(chapterId)) collector.add({ severity: "ERROR", code: "PLACEMENT_CHAPTER_MISSING", message: "知识点位置找不到对应的章节。", entity_type: "placement", entity_id: id, related_ids: chapterId ? [chapterId] : undefined });
     if (!integrityValidSort(row.sort_order)) collector.add({ severity: "ERROR", code: "PLACEMENT_SORT_INVALID", message: "知识点位置排序值无效。", entity_type: "placement", entity_id: id });
     if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "PLACEMENT_DELETED_AT_INVALID", message: "知识点位置 deleted_at 字段无效。", entity_type: "placement", entity_id: id });
-    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "PLACEMENT_DELETION_BATCH_MISSING", message: "回收站知识点位置缺少删除批次标记。", entity_type: "placement", entity_id: id });
+    if (integrityIsLegacyDeletedWithoutBatch(row)) collector.addLegacy();
+    else if (integrityIsMissingDeletionBatch(row)) collector.add({ severity: "ERROR", code: "PLACEMENT_DELETION_BATCH_MISSING", message: "回收站知识点位置缺少删除批次标记。", entity_type: "placement", entity_id: id });
     if (!integrityValidRevision(row.note_revision)) collector.add({ severity: "ERROR", code: "NOTE_REVISION_INVALID", message: "知识点位置的本章补充版本号无效。", entity_type: "placement", entity_id: id });
     if (integrityIsActive(row)) {
       if (pointId && points.has(pointId) && integrityIsDeleted(points.get(pointId)!)) collector.add({ severity: "ERROR", code: "PLACEMENT_POINT_DELETED", message: "活动知识点位置指向了回收站中的知识点。", entity_type: "placement", entity_id: id, related_ids: [pointId] });
@@ -960,7 +1003,9 @@ async function integrityCheckHistory(tables: IntegrityTables) {
     const snapshot = integrityHistorySnapshot(row.snapshot);
     if (!snapshot.valid) collector.add({ severity: "ERROR", code: "HISTORY_SNAPSHOT_INVALID", message: `知识点历史快照无效：${snapshot.reason ?? "格式错误"}。`, entity_type: "knowledge_point_version", entity_id: id });
     if (!integrityValidDate(row.created_at)) collector.add({ severity: "ERROR", code: "HISTORY_TIMESTAMP_INVALID", message: "知识点历史版本时间无效。", entity_type: "knowledge_point_version", entity_id: id });
-    if (!await integrityHashMatches(row.snapshot, row.content_hash)) collector.add({ severity: "ERROR", code: "HISTORY_HASH_INVALID", message: "知识点历史版本哈希校验失败。", entity_type: "knowledge_point_version", entity_id: id });
+    const historyHashStatus = await integrityHistoryHashStatus(row.snapshot, row.content_hash);
+    if (historyHashStatus === "LEGACY") collector.addLegacy();
+    else if (historyHashStatus === "INVALID") collector.add({ severity: "ERROR", code: "HISTORY_HASH_INVALID", message: "知识点历史版本哈希校验失败。", entity_type: "knowledge_point_version", entity_id: id });
   }
   const noteHashes = new Set<string>();
   for (const row of noteVersions) {
@@ -987,7 +1032,8 @@ function integrityCheckRecycleAndRevisions(tables: IntegrityTables) {
   const collector = createIntegrityCollector();
   for (const row of [...chapters, ...points, ...placements]) {
     if (row.deleted_at !== null && !integrityIsDeleted(row)) collector.add({ severity: "ERROR", code: "DELETED_AT_INVALID", message: "回收站状态的 deleted_at 字段无效。", entity_type: "recycle_item", entity_id: integrityId(row) });
-    if (integrityIsDeleted(row) && row.deletion_batch_id === null) collector.add({ severity: "WARNING", code: "DELETION_BATCH_MISSING", message: "回收站项目缺少删除批次标记。", entity_type: "recycle_item", entity_id: integrityId(row) });
+    if (integrityIsLegacyDeletedWithoutBatch(row)) collector.addLegacy();
+    else if (integrityIsMissingDeletionBatch(row)) collector.add({ severity: "ERROR", code: "DELETION_BATCH_MISSING", message: "回收站项目缺少删除批次标记。", entity_type: "recycle_item", entity_id: integrityId(row) });
     if (integrityIsActive(row) && row.deletion_batch_id !== null) collector.add({ severity: "WARNING", code: "ACTIVE_DELETION_BATCH", message: "活动数据仍保留删除批次标记，请留意恢复状态。", entity_type: "recycle_item", entity_id: integrityId(row) });
   }
   const chapterMap = new Map(chapters.map((row) => [integrityId(row), row] as const).filter(([id]) => Boolean(id)) as Array<[string, Record<string, unknown>]>);
@@ -1027,6 +1073,7 @@ function buildIntegrityReportText(report: Omit<IntegrityReport, "report_text">) 
       const entity = issue.entity_id ? `（${issue.entity_type ?? "记录"} ${issue.entity_id}）` : "";
       lines.push(`- [${issue.severity}] ${issue.message}${entity}`);
     }
+    if (section.legacy_count > 0) lines.push(`- 历史兼容数据：${section.legacy_count} 条（LEGACY，不视为错误）`);
     if (section.truncated_issue_count > 0) lines.push(`- 另有 ${section.truncated_issue_count} 条同类问题未在报告中展开。`);
   }
   return lines.join("\n");
@@ -1059,6 +1106,7 @@ async function runIntegrityCheck(client: SupabaseClient): Promise<IntegrityRepor
     schema_version: "0016",
     backup_format_version: BACKUP_FORMAT_VERSION,
     issue_count: sections.reduce((total, section) => total + section.issue_count, 0),
+    legacy_count: sections.reduce((total, section) => total + section.legacy_count, 0),
     summary: status === "CHECK_FAILED"
       ? "检查未完整完成，部分数据未能读取。"
       : status === "ERROR"
