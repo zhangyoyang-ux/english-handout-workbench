@@ -27,7 +27,7 @@ for (const marker of [
   "explanation", "exercises", "supplement", "inspiration",
   "知识讲解", "例题练习", "补充内容", "💡 灵感",
   "阅读", "编辑", "上一篇", "下一篇", "返回目录", "保存失败",
-  "AUTOSAVE_DELAY = 800", "localStorage", 'endpoint("content"',
+  "AUTOSAVE_DELAY = 1300", "localStorage", 'endpoint("content"',
 ]) contains(app, marker);
 assert.doesNotMatch(app, /dangerouslySetInnerHTML|图片上传/);
 

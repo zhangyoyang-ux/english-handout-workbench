@@ -12,7 +12,7 @@ assert.match(read("supabase/migrations/0001_stage1_notes.sql"), /created_at time
 assert.match(read("supabase/migrations/0001_stage1_notes.sql"), /updated_at timestamptz/);
 
 const app = read("src/main.tsx");
-assert.match(app, /AUTOSAVE_DELAY = 800/);
+assert.match(app, /AUTOSAVE_DELAY = 1300/);
 assert.match(app, /functions\/v1\/notes/);
 assert.match(app, /localStorage/);
 assert.match(app, /保存失败/);
