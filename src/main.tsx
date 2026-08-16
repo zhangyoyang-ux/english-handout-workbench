@@ -181,6 +181,16 @@ function emptyContentDraft(): ContentDraft { return { explanation: emptyDocument
 function contentDraftFromRecord(record: KnowledgePointContent | null): ContentDraft {
   return { explanation: normaliseDocument(record?.explanation), exercises: normaliseDocument(record?.exercises), supplement: normaliseDocument(record?.supplement), inspiration: normaliseDocument(record?.inspiration) };
 }
+function richDocumentPreview(document: RichDocument | null | undefined): string {
+  const blockTypes = new Set(["blockquote", "heading", "listItem", "paragraph", "orderedList", "bulletList"]);
+  const readNode = (node: JSONContent): string => {
+    const ownText = typeof node.text === "string" ? node.text : "";
+    const childText = Array.isArray(node.content) ? node.content.map(readNode).join("") : "";
+    return `${ownText}${childText}${node.type && blockTypes.has(node.type) ? "\n" : ""}`;
+  };
+  const text = readNode(document ?? emptyDocument()).replace(/\s+/g, " ").trim();
+  return text.length > 140 ? `${text.slice(0, 140).trimEnd()}…` : text;
+}
 function documentHasText(document: RichDocument): boolean {
   if (typeof document.text === "string" && document.text.trim()) return true;
   return Array.isArray(document.content) && document.content.some((node) => documentHasText(node));
@@ -285,6 +295,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [contentRecord, setContentRecord] = useState<KnowledgePointContent | null>(null);
   const [contentDraft, setContentDraft] = useState<ContentDraft>(emptyContentDraft);
+  const [chapterPreviews, setChapterPreviews] = useState<Record<string, string>>({});
   const [contentDirty, setContentDirty] = useState(false);
   const [chapterNoteDraft, setChapterNoteDraft] = useState<RichDocument>(emptyDocument);
   const [chapterNoteDirty, setChapterNoteDirty] = useState(false);
@@ -630,6 +641,31 @@ function App() {
   }, [selectedKnowledgePointId]);
 
   useEffect(() => {
+    if (!selectedChapterId) {
+      setChapterPreviews({});
+      return;
+    }
+    const pointIds = sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.chapter_id === selectedChapterId)).map((placement) => placement.knowledge_point_id);
+    if (pointIds.length === 0) {
+      setChapterPreviews({});
+      return;
+    }
+    let cancelled = false;
+    void Promise.all(pointIds.map(async (pointId) => {
+      try {
+        const result = await requestJson<{ ok: true; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
+        return [pointId, richDocumentPreview(result.content?.explanation)] as const;
+      } catch {
+        return [pointId, ""] as const;
+      }
+    })).then((entries) => {
+      if (cancelled) return;
+      setChapterPreviews(entries.reduce<Record<string, string>>((result, [pointId, preview]) => { result[pointId] = preview; return result; }, {}));
+    });
+    return () => { cancelled = true; };
+  }, [selectedChapterId, tree.knowledge_point_placements]);
+
+  useEffect(() => {
     const pointId = selectedKnowledgePointId;
     if (!pointId) { setPointMeta(null); setTagPickerOpen(false); return; }
     void requestJson<{ ok: true } & DiscoveryMeta>(endpoint("discovery_meta", { id: pointId }))
@@ -924,7 +960,7 @@ function App() {
   const renderHomeContent = () => {
     const continueItem = fastAccess.recent[0];
     return <div className="home-panel">
-      <div className="content-heading home-heading"><div><h2>我的讲义</h2></div><button type="button" className="text-link" onClick={() => { setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出 →</button></div>
+      <div className="content-heading home-heading"><div><h2>悠扬讲义</h2></div><button type="button" className="text-link" onClick={() => { setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出 →</button></div>
       {fastAccessLoading && <p className="empty-line">正在读取快速访问……</p>}
       {!fastAccessLoading && continueItem && <section className="fast-section fast-section--continue"><div className="fast-section__heading"><h3>继续整理</h3><span>最近一次真实编辑</span></div>{renderContinueAccess(continueItem)}</section>}
       <section className="fast-section fast-section--pins"><div className="fast-section__heading"><h3>置顶内容</h3><span>最多 4 个</span></div>{fastAccess.pins.length === 0 ? <p className="empty-line">还没有置顶项目。</p> : <div className="access-list access-list--pins">{fastAccess.pins.map((item) => renderAccessButton(item, "置顶", "pin"))}</div>}</section>
@@ -957,7 +993,10 @@ function App() {
       {organizeMode && <p className="organize-context">整理模式已开启</p>}
       {organizeMode && <div className="move-panel"><label htmlFor="chapter-move">移动章节到</label><select id="chapter-move" value={selectedChapter.parent_id ?? ""} disabled={busy} onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}><option value="">一级目录</option>{possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{chapterPath(parent.id)}</option>)}</select></div>}
       <section className="chapter-overview"><div className="section-heading"><h3>章节总览</h3>{hasOverview && !chapterEditMode && <button type="button" className="text-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><button type="button" className="quiet-button overview-done" onClick={() => setChapterEditMode(false)}>完成</button></> : hasOverview ? <div className="chapter-overview__text">{selectedChapter.content}</div> : <button type="button" className="add-overview" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
-      <div className="subsection-grid"><section className="subsection-card"><div className="subsection-card__header"><h3>子章节</h3><span>{children.length}</span></div>{children.length === 0 ? <div className="empty-state-inline"><strong>暂无子章节</strong><span>从这里开始整理这个章节。</span></div> : <div className="content-list">{children.map((child) => <button key={child.id} onClick={() => selectChapter(child.id)}><span>›</span>{child.title}</button>)}</div>}</section><section className="subsection-card"><div className="subsection-card__header"><h3>知识点</h3><span>{placements.length}</span></div>{placements.length === 0 ? <div className="empty-state-inline"><strong>暂无知识点</strong><span>从这里开始整理这个章节。</span></div> : <div className="content-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span>•</span><span className="content-list__title">{point.title}</span><em className={`status-text status-text--${point.status}`}>{pointStatusLabel(point.status)}</em></button> : null; })}</div>}</section></div><div className="chapter-create-point"><button type="button" className="secondary-button" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div></div>;
+      <div className="chapter-sequence">
+        {children.length > 0 && <section className="subsection-card chapter-children-section"><div className="subsection-card__header"><div><h3>子章节</h3><span>继续深入当前目录</span></div><span>{children.length}</span></div><div className="chapter-child-list">{children.map((child) => <button type="button" className="chapter-child-link" key={child.id} onClick={() => selectChapter(child.id)}><span className="chapter-child-link__title">{child.title}</span><span className="chapter-child-link__arrow" aria-hidden="true">›</span></button>)}</div></section>}
+        <section className="subsection-card chapter-points-section"><div className="subsection-card__header"><div><h3>知识点</h3><span>当前章节的讲义内容</span></div><div className="subsection-card__header-actions"><span>{placements.length}</span><button type="button" className="text-link knowledge-create-link" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div></div>{placements.length === 0 ? <div className="empty-state-inline"><strong>暂无知识点</strong><span>从这里开始整理这个章节。</span></div> : <div className="chapter-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); if (!point) return null; return <button type="button" className="chapter-point-link" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span className="content-list__body"><strong className="content-list__title">{point.title}</strong>{chapterPreviews[point.id] && <span className="content-list__preview">{chapterPreviews[point.id]}</span>}<em className={`status-text status-text--${point.status}`}>{pointStatusLabel(point.status)}</em></span><span className="content-list__arrow" aria-hidden="true">›</span></button>; })}</div>}</section>
+      </div></div>;
   };
 
   const renderKnowledgePointContent = () => {
@@ -1077,7 +1116,7 @@ function App() {
     const rootChapters = childrenOf(null);
     return <div className="mobile-page mobile-home-page">
       <header className="mobile-header mobile-header--home">
-        <h1 id="mobile-page-title">我的讲义</h1>
+        <h1 id="mobile-page-title">悠扬讲义</h1>
         <div className="mobile-header__actions"><button type="button" className="mobile-icon-button" aria-label="搜索讲义" onClick={() => setMobileSearchOpen(true)}>⌕</button><button type="button" className="mobile-icon-button" aria-label="更多操作" onClick={() => setMobileSheet("menu")}>···</button></div>
       </header>
       {renderMobileMessage()}
@@ -1088,12 +1127,13 @@ function App() {
         <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>章节</h2><span>{rootChapters.length} 个一级章节</span></div></div>{rootChapters.length === 0 ? <p className="mobile-empty">还没有章节，从这里开始整理你的知识体系。</p> : <div className="mobile-chapter-list">{rootChapters.map((chapter) => <button type="button" className="mobile-list-row" key={chapter.id} onClick={() => selectChapter(chapter.id)}><span>{chapter.title}</span><span aria-hidden="true">›</span></button>)}</div>}</section>
         <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>最近编辑</h2><span>最多 6 条</span></div></div>{fastAccess.recent.length === 0 ? <p className="mobile-empty">还没有最近编辑记录。</p> : <div className="mobile-access-list">{fastAccess.recent.slice(0, 6).map((item) => renderMobileAccessRow(item))}</div>}</section>
         <section className="mobile-home-section mobile-home-section--favorites"><button type="button" className="mobile-light-link" onClick={() => setShowFavorites((value) => !value)}>收藏 <span>（{fastAccess.favorites.length}）</span><b aria-hidden="true">›</b></button><button type="button" className="mobile-light-link" onClick={() => openRecycleBin()}>回收站 <b aria-hidden="true">›</b></button>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="mobile-empty">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="mobile-access-list">{fastAccess.favorites.map((item) => renderMobileAccessRow(item, "收藏"))}</div>)}</section>
+        <p className="mobile-home-signature">笨蛋也能学好英语</p>
       </div>}
     </div>;
   };
 
   const renderMobileOrganize = () => <div className="mobile-page mobile-organize-page">
-    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => setOrganizeMode(false)}>‹ 我的讲义</button><h1>整理目录</h1><button type="button" className="mobile-text-button" onClick={() => setOrganizeMode(false)}>完成</button></header>
+    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => setOrganizeMode(false)}>‹ 悠扬讲义</button><h1>整理目录</h1><button type="button" className="mobile-text-button" onClick={() => setOrganizeMode(false)}>完成</button></header>
     {renderMobileMessage()}
     <p className="mobile-page-intro">在这里调整章节层级与顺序。完成后返回正常阅读。</p>
     <div className="mobile-organize-tree">{loading ? <p className="mobile-loading">正在读取目录……</p> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div>
@@ -1105,12 +1145,12 @@ function App() {
     const placements = placementsOf(selectedChapter.id);
     const hasOverview = Boolean(selectedChapter.content.trim());
     return <div className="mobile-page mobile-chapter-page">
-      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={mobileGoHome}>‹ 我的讲义</button><h1>{selectedChapter.title}</h1><div className="mobile-header__actions"><button type="button" className="mobile-icon-button" aria-label="新建" onClick={() => setMobileSheet("new")}>＋</button><button type="button" className="mobile-icon-button" aria-label="章节更多操作" onClick={() => setMobileSheet("chapter")}>···</button></div></header>
+      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={mobileGoHome}>‹ 悠扬讲义</button><h1>{selectedChapter.title}</h1><div className="mobile-header__actions"><button type="button" className="mobile-icon-button mobile-child-create" aria-label="新建子章节" onClick={() => createChapter(selectedChapter.id)}>＋</button><button type="button" className="mobile-icon-button" aria-label="章节更多操作" onClick={() => setMobileSheet("chapter")}>···</button></div></header>
       {renderMobileMessage()}
       {selectedChapter.parent_id && <p className="mobile-path">{chapterPath(selectedChapter.id)}</p>}
       <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} /><button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
-      <section className="mobile-chapter-section"><div className="mobile-section-heading"><div><h2>子章节</h2><span>{children.length} 个</span></div></div>{children.length === 0 ? <p className="mobile-empty">暂无子章节</p> : <div className="mobile-chapter-list">{children.map((child) => <button type="button" className="mobile-list-row" key={child.id} onClick={() => selectChapter(child.id)}><span>{child.title}</span><span aria-hidden="true">›</span></button>)}</div>}</section>
-      <section className="mobile-chapter-section"><div className="mobile-section-heading"><div><h2>知识点</h2><span>{placements.length} 个</span></div></div>{placements.length === 0 ? <p className="mobile-empty">暂无知识点</p> : <div className="mobile-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button type="button" className="mobile-list-row mobile-list-row--point" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span><strong>{point.title}</strong><small>{pointStatusLabel(point.status)}</small></span><span aria-hidden="true">›</span></button> : null; })}</div>}</section>
+      {children.length > 0 && <section className="mobile-chapter-section mobile-chapter-children-section"><div className="mobile-section-heading"><div><h2>子章节</h2><span>继续深入当前目录</span></div><span>{children.length}</span></div><div className="mobile-child-list">{children.map((child) => <button type="button" className="mobile-child-row" key={child.id} onClick={() => selectChapter(child.id)}><span>{child.title}</span><span aria-hidden="true">›</span></button>)}</div></section>}
+      <section className="mobile-chapter-section mobile-chapter-points-section"><div className="mobile-section-heading"><div><h2>知识点</h2><span>{placements.length} 个</span></div><button type="button" className="mobile-inline-link mobile-knowledge-create" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button></div>{placements.length === 0 ? <p className="mobile-empty">暂无知识点</p> : <div className="mobile-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button type="button" className="mobile-list-row mobile-list-row--point" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span><strong>{point.title}</strong>{chapterPreviews[point.id] && <small className="mobile-point-preview">{chapterPreviews[point.id]}</small>}<small className={`mobile-status-text mobile-status-text--${point.status}`}>{pointStatusLabel(point.status)}</small></span><span aria-hidden="true">›</span></button> : null; })}</div>}</section>
     </div>;
   };
 
@@ -1122,7 +1162,7 @@ function App() {
     const hasReadableContent = CONTENT_SECTIONS.some((section) => documentHasText(contentDraft[section]));
     const hasChapterNote = documentHasText(chapterNoteDraft);
     return <div className="mobile-page mobile-knowledge-point">
-      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={() => selectedChapterId ? selectChapter(selectedChapterId) : mobileGoHome()}>‹ {selectedChapter?.title ?? "我的讲义"}</button><div className="mobile-header__actions"><SaveBadge state={saveState} /><button type="button" className="mobile-icon-button" aria-label="知识点更多操作" onClick={() => setMobileSheet("point")}>···</button></div></header>
+      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={() => selectedChapterId ? selectChapter(selectedChapterId) : mobileGoHome()}>‹ {selectedChapter?.title ?? "悠扬讲义"}</button><div className="mobile-header__actions"><SaveBadge state={saveState} /><button type="button" className="mobile-icon-button" aria-label="知识点更多操作" onClick={() => setMobileSheet("point")}>···</button></div></header>
       {renderMobileMessage()}
       <div className="mobile-point-heading">{viewMode === "edit" ? <input className="mobile-point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /> : <h1>{selectedKnowledgePoint.title}</h1>}<div className="mobile-point-meta"><span className="mobile-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span>{(pointMeta?.tags ?? []).slice(0, 3).map((tag) => <span className="mobile-tag" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length > 3 && <button type="button" className="mobile-inline-link" onClick={() => setTagPickerOpen((value) => !value)}>更多</button>}</div></div>
       <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
@@ -1135,7 +1175,7 @@ function App() {
   };
 
   const renderMobileSearch = () => <div className="mobile-page mobile-search-page">
-    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => { setMobileSearchOpen(false); setSearchQuery(""); }}>‹ 我的讲义</button><h1>搜索讲义</h1><button type="button" className="mobile-icon-button" aria-label="搜索筛选" onClick={() => setMobileSheet("filters")}>···</button></header>
+    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => { setMobileSearchOpen(false); setSearchQuery(""); }}>‹ 悠扬讲义</button><h1>搜索讲义</h1><button type="button" className="mobile-icon-button" aria-label="搜索筛选" onClick={() => setMobileSheet("filters")}>···</button></header>
     <label className="mobile-search-box"><span aria-hidden="true">⌕</span><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索知识点、例题、灵感……" aria-label="搜索讲义" /></label>
     <div className="mobile-filter-chips"><button type="button" className={!searchStatus ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} onClick={() => setSearchStatus("")}>全部</button>{(["draft", "needs_improvement", "organized"] as PointStatus[]).map((status) => <button type="button" className={searchStatus === status ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} key={status} onClick={() => setSearchStatus(status)}>{pointStatusLabel(status)}</button>)}<button type="button" className={searchTagId ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} onClick={() => setMobileSheet("filters")}>{searchTagId ? tags.find((tag) => tag.id === searchTagId)?.name ?? "标签" : "标签"}</button></div>
     {!searchQuery.trim() ? <p className="mobile-search-empty">输入关键词开始搜索。</p> : searchLoading ? <p className="mobile-loading">正在搜索……</p> : searchError ? <p className="mobile-search-error">{searchError}</p> : searchResults.length === 0 ? <p className="mobile-search-empty">没有搜索结果，换一个关键词试试。</p> : <div className="mobile-search-results">{searchResults.map((result) => <button type="button" className="mobile-search-result" key={result.id} onClick={() => openSearchResult(result)}><strong>{result.title}</strong><span>{result.context?.path ?? result.paths[0] ?? "知识点"}</span><small>{result.match_types.map(matchTypeLabel).join(" · ")}{result.tags.length > 0 ? ` · ${result.tags.map((tag) => tag.name).join(" · ")}` : ""}</small>{result.context?.text && <p>{result.context.text}</p>}</button>)}</div>}

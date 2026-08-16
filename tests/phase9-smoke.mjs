@@ -41,12 +41,19 @@ for (const marker of [
   "笨蛋也能学好英语",
   "favorite-entry",
   "chapter-new-child",
-  "chapter-create-point",
+  "chapter-sequence",
+  "chapter-child-link",
+  "chapter-point-link",
+  "content-list__preview",
+  "mobile-home-signature",
+  "mobile-child-row",
+  "mobile-point-preview",
 ]) assert.match(app, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `app marker: ${marker}`);
 
 assert.doesNotMatch(app, /<section className="fast-section chapter-section"/, "desktop home keeps chapters in the left tree only");
+assert.doesNotMatch(app, /subsection-grid|chapter-create-point/, "chapter page uses one vertical sequence with one knowledge-point create entry");
 
-for (const marker of ["phase9-overlay-backdrop", "phase9-panel", "phase9-export-browser", "phase9-export-selected", "@media (max-width: 900px)", "--ui-action", "--ui-success", "--ui-pending", "home-signature"]) {
+for (const marker of ["phase9-overlay-backdrop", "phase9-panel", "phase9-export-browser", "phase9-export-selected", "@media (max-width: 900px)", "--ui-action", "--ui-success", "--ui-pending", "--ui-teal", "--ui-lavender", "--ui-rose", "--ui-ink-blue", "home-signature"]) {
   assert.match(styles, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `style marker: ${marker}`);
 }
 
