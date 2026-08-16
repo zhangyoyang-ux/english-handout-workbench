@@ -464,7 +464,12 @@ async function preflightFullBackup(client: SupabaseClient, backup: FullBackup) {
 async function restoreFullBackup(client: SupabaseClient, backup: FullBackup) {
   const { data, error } = await client.rpc("restore_workbench_backup", { p_backup: backup, p_apply: true });
   if (error) throw error;
-  const postCheck = await postRestoreVerify(client, backup);
+  let postCheck: { passed: boolean; counts: Record<BackupTableName, number> };
+  try {
+    postCheck = await postRestoreVerify(client, backup);
+  } catch {
+    throw new Error("BACKUP_POSTCHECK_FAILED");
+  }
   return { restore: data as Record<string, unknown>, post_check: postCheck };
 }
 
@@ -837,7 +842,10 @@ function databaseError(request: Request, error: unknown, fallback: string) {
   for (const [code, messageText] of Object.entries(backupValidationCodes)) {
     if (message.includes(code)) return json(request, 400, { ok: false, error: { code, message: messageText } });
   }
-  if (message.includes("BACKUP_POSTCHECK_FAILED") || message.includes("BACKUP_RESTORE_TRANSACTION_FAILED")) {
+  if (message.includes("BACKUP_POSTCHECK_FAILED")) {
+    return json(request, 500, { ok: false, error: { code: "BACKUP_POSTCHECK_FAILED", message: "恢复后的数据校验未通过，数据库已保持恢复前状态。" } });
+  }
+  if (message.includes("BACKUP_RESTORE_TRANSACTION_FAILED")) {
     return json(request, 500, { ok: false, error: { code: "BACKUP_RESTORE_TRANSACTION_FAILED", message: "恢复失败，数据库已保持恢复前状态。" } });
   }
 
