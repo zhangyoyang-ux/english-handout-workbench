@@ -51,7 +51,7 @@ for (const marker of [
   "recycleRestoreTarget",
   "mobile-workbench",
 ]) contains(app, marker);
-assert.doesNotMatch(app, /Word 导出|PDF 导出|图片上传|AI 助手/);
+assert.doesNotMatch(app, /PDF 导出|图片上传|AI 助手/);
 
 const styles = read("src/styles.css");
 for (const marker of ["phase8-overlay-backdrop", "phase8-history", "phase8-recycle", "@media (max-width: 900px)"]) contains(styles, marker);

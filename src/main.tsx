@@ -3,6 +3,7 @@ import { EditorContent, useEditor, type Editor } from "@tiptap/react";
 import type { JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import { createRoot } from "react-dom/client";
+import type { ExportContentInput, ExportSelection, ExportTreeInput } from "./wordExport";
 import "./styles.css";
 
 type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
@@ -160,6 +161,8 @@ const EDITOR_EXTENSIONS = [StarterKit.configure({
   heading: { levels: [2, 3] },
 })];
 
+const loadWordExport = () => import("./wordExport");
+
 class ApiRequestError extends Error {
   code?: string;
   details?: ApiErrorPayload;
@@ -310,6 +313,10 @@ function App() {
   const [recycleLoading, setRecycleLoading] = useState(false);
   const [recycleRestoreTarget, setRecycleRestoreTarget] = useState<RecycleItem | null>(null);
   const [recycleTargetChapterId, setRecycleTargetChapterId] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportSelectedItems, setExportSelectedItems] = useState<ExportSelection[]>([]);
+  const [exportExpandedChapterIds, setExportExpandedChapterIds] = useState<Set<string>>(new Set());
+  const [exportBusy, setExportBusy] = useState(false);
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const contentVersionRef = useRef(0);
@@ -338,6 +345,76 @@ function App() {
       setSelectedChapterId(null);
     }
   }, []);
+
+  const readFreshExportContext = useCallback(async (pointIds?: string[]) => {
+    const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+    const freshTree = { chapters: result.chapters ?? [], knowledge_points: result.knowledge_points ?? [], knowledge_point_placements: result.knowledge_point_placements ?? [] };
+    const ids = pointIds ?? [...new Set(freshTree.knowledge_point_placements.map((placement) => placement.knowledge_point_id))];
+    const contentResults = await Promise.all(ids.map(async (pointId) => {
+      const contentResult = await requestJson<{ ok: true; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
+      return [pointId, contentResult.content ? contentDraftFromRecord(contentResult.content) as ExportContentInput : null] as const;
+    }));
+    return { tree: freshTree as unknown as ExportTreeInput, contents: new Map<string, ExportContentInput | null>(contentResults) };
+  }, []);
+
+  const exportIsReady = () => {
+    if (exportBusy) return false;
+    if (saveState === "saving" || saveState === "dirty" || saveState === "error" || contentDirty || chapterNoteDirty) {
+      setMessage("当前修改尚未成功保存，请先完成保存后再导出。");
+      return false;
+    }
+    return true;
+  };
+
+  const exportKnowledgePoint = async () => {
+    if (!selectedKnowledgePointId || !exportIsReady()) return;
+    setExportBusy(true); setMessage("");
+    try {
+      const context = await readFreshExportContext([selectedKnowledgePointId]);
+      const point = context.tree.knowledge_points.find((item) => item.id === selectedKnowledgePointId);
+      const placement = context.tree.knowledge_point_placements.find((item) => item.knowledge_point_id === selectedKnowledgePointId && item.chapter_id === selectedChapterId)
+        ?? context.tree.knowledge_point_placements.find((item) => item.knowledge_point_id === selectedKnowledgePointId);
+      if (!point || !placement) throw new Error("知识点当前没有可导出的有效引用。");
+      const { buildKnowledgePointExportModel, createDocxBlob, downloadDocx, safeDocxFilename } = await loadWordExport();
+      const blob = await createDocxBlob(buildKnowledgePointExportModel(point, placement, context.contents.get(point.id)));
+      downloadDocx(blob, safeDocxFilename(point.title));
+      setMessage("Word 已生成并开始下载。");
+    } catch (error) {
+      setMessage(error instanceof Error ? `Word 生成失败，请重试：${error.message}` : "Word 生成失败，请重试。");
+    } finally { setExportBusy(false); }
+  };
+
+  const exportChapter = async () => {
+    if (!selectedChapterId || !exportIsReady()) return;
+    setExportBusy(true); setMessage("");
+    try {
+      const context = await readFreshExportContext();
+      const chapter = context.tree.chapters.find((item) => item.id === selectedChapterId);
+      if (!chapter) throw new Error("章节不存在或已移入回收站。");
+      const { buildChapterExportModel, createDocxBlob, downloadDocx, safeDocxFilename } = await loadWordExport();
+      const blob = await createDocxBlob(buildChapterExportModel(chapter.id, context.tree, context.contents));
+      downloadDocx(blob, safeDocxFilename(chapter.title));
+      setMessage("章节 Word 已生成并开始下载。");
+    } catch (error) {
+      setMessage(error instanceof Error ? `Word 生成失败，请重试：${error.message}` : "Word 生成失败，请重试。");
+    } finally { setExportBusy(false); }
+  };
+
+  const generateCombinedExport = async () => {
+    if (exportSelectedItems.length === 0 || !exportIsReady()) return;
+    setExportBusy(true); setMessage("");
+    try {
+      const ids = [...new Set(exportSelectedItems.map((item) => item.knowledgePointId))];
+      const context = await readFreshExportContext(ids);
+      const { buildCombinedExportModel, createDocxBlob, downloadDocx, safeDocxFilename } = await loadWordExport();
+      const blob = await createDocxBlob(buildCombinedExportModel(exportSelectedItems, context.tree, context.contents));
+      downloadDocx(blob, safeDocxFilename("英语讲义"));
+      setExportOpen(false);
+      setMessage("组合 Word 已生成并开始下载。");
+    } catch (error) {
+      setMessage(error instanceof Error ? `Word 生成失败，请重试：${error.message}` : "Word 生成失败，请重试。");
+    } finally { setExportBusy(false); }
+  };
 
   const loadFastAccess = useCallback(async () => {
     setFastAccessLoading(true);
@@ -828,7 +905,7 @@ function App() {
     const continueItem = fastAccess.recent[0];
     const rootChapters = childrenOf(null);
     return <div className="home-panel">
-      <div className="content-heading home-heading"><div><h2>我的讲义</h2><p className="content-hint">整理、阅读与维护你的英语知识体系</p></div></div>
+      <div className="content-heading home-heading"><div><h2>我的讲义</h2><p className="content-hint">整理、阅读与维护你的英语知识体系</p></div><button type="button" className="text-link" onClick={() => { setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出 →</button></div>
       {fastAccessLoading && <p className="empty-line">正在读取快速访问……</p>}
       {!fastAccessLoading && continueItem && <section className="fast-section fast-section--continue"><div className="fast-section__heading"><h3>继续整理</h3><span>最近一次真实编辑</span></div>{renderAccessButton(continueItem, "继续")}</section>}
       <section className="fast-section fast-section--pins"><div className="fast-section__heading"><h3>置顶</h3><span>最多 4 个</span></div>{fastAccess.pins.length === 0 ? <p className="empty-line">还没有置顶项目。</p> : <div className="access-list access-list--pins">{fastAccess.pins.map((item) => renderAccessButton(item, "置顶"))}</div>}</section>
@@ -857,7 +934,7 @@ function App() {
     if (!selectedChapter) return <EmptyState onCreateRoot={() => createChapter(null)} />;
     const children = childrenOf(selectedChapter.id); const placements = placementsOf(selectedChapter.id);
     const hasOverview = Boolean(selectedChapter.content.trim());
-    return <div className="chapter-page"><div className="content-heading chapter-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2></div><div className="content-heading__tools"><SaveBadge state={saveState} /><details className="more-menu"><summary aria-label="章节更多操作">···</summary><div className="more-menu__content"><button type="button" onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button type="button" onClick={() => renameChapter(selectedChapter)}>重命名</button><button type="button" onClick={() => deleteChapter(selectedChapter)} className="more-menu__danger">删除章节</button></>}</div></details></div></div>
+    return <div className="chapter-page"><div className="content-heading chapter-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2></div><div className="content-heading__tools"><SaveBadge state={saveState} /><details className="more-menu"><summary aria-label="章节更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportChapter()}>导出本章 Word</button><button type="button" onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button type="button" onClick={() => renameChapter(selectedChapter)}>重命名</button><button type="button" onClick={() => deleteChapter(selectedChapter)} className="more-menu__danger">删除章节</button></>}</div></details></div></div>
       <div className="action-row chapter-actions"><details className="new-menu"><summary>＋ 新建</summary><div className="more-menu__content"><button type="button" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>新建子章节</button><button type="button" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>新建知识点</button></div></details>{organizeMode && <span className="organize-context">整理模式已开启</span>}</div>
       {organizeMode && <div className="move-panel"><label htmlFor="chapter-move">移动章节到</label><select id="chapter-move" value={selectedChapter.parent_id ?? ""} disabled={busy} onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}><option value="">一级目录</option>{possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{chapterPath(parent.id)}</option>)}</select></div>}
       <section className="chapter-overview"><div className="section-heading"><h3>章节总览</h3>{hasOverview && !chapterEditMode && <button type="button" className="text-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><button type="button" className="quiet-button overview-done" onClick={() => setChapterEditMode(false)}>完成</button></> : hasOverview ? <div className="chapter-overview__text">{selectedChapter.content}</div> : <button type="button" className="add-overview" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
@@ -873,7 +950,7 @@ function App() {
     const hasChapterNote = documentHasText(chapterNoteDraft);
     return <div className="knowledge-point-page">
       <div className="content-heading"><div>{viewMode === "edit" ? <><p className="content-kicker">知识点 · 编辑</p><input className="point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /></> : <><p className="content-kicker">知识点 · 阅读</p><h2>{selectedKnowledgePoint.title}</h2></>}<p className="content-hint">当前 placement：{selectedChapter ? chapterPath(selectedChapter.id) : "当前目录"}</p></div><SaveBadge state={saveState} /></div>
-      <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button type="button" onClick={() => openHistory("shared")}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => openHistory("placement")}>本章补充历史</button>}{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
+      <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={exportBusy} onClick={() => void exportKnowledgePoint()}>导出 Word</button><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button type="button" onClick={() => openHistory("shared")}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => openHistory("placement")}>本章补充历史</button>}{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
       <div className="tag-strip"><span className="tag-strip__label">标签</span>{(pointMeta?.tags ?? []).map((tag) => <span className="tag-chip" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length === 0 && <span className="empty-line">暂无标签</span>}{viewMode === "edit" && <button type="button" className="quiet-button tag-edit-button" onClick={() => setTagPickerOpen((value) => !value)}>{tagPickerOpen ? "收起标签" : "编辑标签"}</button>}</div>
       {tagPickerOpen && viewMode === "edit" && <div className="tag-picker"><div className="tag-picker__options">{tags.map((tag) => <label className="tag-option" key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="reference-picker"><div className="reference-picker__header"><div><strong>选择目标章节</strong><span>只新增 placement，共享核心不复制。</span></div><button type="button" className="quiet-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><div className="reference-picker__tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
@@ -911,6 +988,55 @@ function App() {
         <p className="phase8-note">不提供永久删除和自动清理；回收站只用于可逆恢复。</p>
       </section>
       {recycleRestoreTarget && <div className="phase8-confirm-backdrop" role="presentation"><section className="phase8-confirm" role="dialog" aria-modal="true" aria-label="选择知识点恢复位置" onMouseDown={(event) => event.stopPropagation()}><h3>选择恢复位置</h3><p>原来的章节引用都不可用，请选择一个当前章节作为新的引用位置。</p><select className="phase8-target-select" value={recycleTargetChapterId} onChange={(event) => setRecycleTargetChapterId(event.target.value)}><option value="">请选择当前章节</option>{recycleActiveChapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.path || chapter.title}</option>)}</select><div className="phase8-confirm__actions"><button type="button" className="quiet-button" onClick={() => setRecycleRestoreTarget(null)}>取消</button><button type="button" className="primary-button" disabled={!recycleTargetChapterId} onClick={() => void restoreRecycleItem(recycleRestoreTarget, false, recycleTargetChapterId)}>恢复到此章节</button></div></section></div>}
+    </div>;
+  };
+
+  const toggleExportChapter = (chapterId: string) => setExportExpandedChapterIds((previous) => {
+    const next = new Set(previous);
+    if (next.has(chapterId)) next.delete(chapterId); else next.add(chapterId);
+    return next;
+  });
+  const toggleExportPlacement = (placement: Placement) => {
+    const point = pointMap.get(placement.knowledge_point_id);
+    if (!point) return;
+    const item: ExportSelection = { placementId: placement.id, knowledgePointId: point.id, chapterId: placement.chapter_id, title: point.title, path: chapterPath(placement.chapter_id) };
+    setExportSelectedItems((previous) => previous.some((selected) => selected.placementId === item.placementId)
+      ? previous.filter((selected) => selected.placementId !== item.placementId)
+      : [...previous, item]);
+  };
+  const moveExportSelection = (index: number, direction: -1 | 1) => setExportSelectedItems((previous) => {
+    const target = index + direction;
+    if (target < 0 || target >= previous.length) return previous;
+    const next = [...previous]; const [item] = next.splice(index, 1); next.splice(target, 0, item); return next;
+  });
+  const removeExportSelection = (placementId: string) => setExportSelectedItems((previous) => previous.filter((item) => item.placementId !== placementId));
+  const renderExportChapter = (chapter: Chapter, depth = 0): ReactNode => {
+    const children = childrenOf(chapter.id);
+    const placements = placementsOf(chapter.id);
+    const expanded = exportExpandedChapterIds.has(chapter.id);
+    const hasChildren = children.length > 0 || placements.length > 0;
+    return <div className="phase9-export-branch" key={chapter.id}>
+      <div className="phase9-export-chapter-row" style={{ "--tree-depth": depth } as CSSProperties}>
+        <button type="button" className={`tree-toggle ${hasChildren ? "" : "tree-toggle--empty"}`} aria-label={expanded ? "折叠导出章节" : "展开导出章节"} onClick={() => hasChildren && toggleExportChapter(chapter.id)}>{hasChildren ? (expanded ? "⌄" : ">") : "·"}</button>
+        <span>{chapter.title}</span>
+      </div>
+      {expanded && <div className="phase9-export-branch__children">
+        {placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); if (!point) return null; const checked = exportSelectedItems.some((item) => item.placementId === placement.id); return <label className="phase9-export-point" key={placement.id}><input type="checkbox" checked={checked} onChange={() => toggleExportPlacement(placement)} /><span>{point.title}</span></label>; })}
+        {children.map((child) => renderExportChapter(child, depth + 1))}
+      </div>}
+    </div>;
+  };
+  const renderExportDrawer = () => {
+    if (!exportOpen) return null;
+    return <div className="phase9-overlay-backdrop" role="presentation" onMouseDown={() => !exportBusy && setExportOpen(false)}>
+      <section className="phase9-panel" role="dialog" aria-modal="true" aria-label="组合导出" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="phase9-panel__header"><div><p className="content-kicker">即时生成 DOCX</p><h2>组合导出</h2><span>按目录逐层选择知识点；同一知识点的不同章节引用可以分别选择。</span></div><button type="button" className="quiet-button" disabled={exportBusy} onClick={() => setExportOpen(false)}>关闭</button></header>
+        <div className="phase9-export-body">
+          <div className="phase9-export-browser"><div className="phase9-export-subheading"><strong>按章节选择</strong><span>已软删除的内容不会显示</span></div>{childrenOf(null).map((chapter) => renderExportChapter(chapter))}</div>
+          <aside className="phase9-export-selected"><div className="phase9-export-subheading"><strong>已选内容</strong><span>{exportSelectedItems.length} 个知识点</span></div>{exportSelectedItems.length === 0 ? <p className="empty-line">从左侧章节中勾选知识点。</p> : <div className="phase9-export-selected-list">{exportSelectedItems.map((item, index) => <div className="phase9-export-selected-item" key={item.placementId}><span><strong>{item.title}</strong><small>{item.path}</small></span><span className="phase9-export-order"><button type="button" aria-label="上移导出项" disabled={index === 0} onClick={() => moveExportSelection(index, -1)}>↑</button><button type="button" aria-label="下移导出项" disabled={index === exportSelectedItems.length - 1} onClick={() => moveExportSelection(index, 1)}>↓</button><button type="button" aria-label="移除导出项" onClick={() => removeExportSelection(item.placementId)}>×</button></span></div>)}</div>}</aside>
+        </div>
+        <footer className="phase9-export-footer"><span>只导出当前正式内容，不包含标签、状态、历史版本或回收站项目。</span><button type="button" className="primary-button" disabled={exportBusy || exportSelectedItems.length === 0} onClick={() => void generateCombinedExport()}>{exportBusy ? "正在生成……" : "生成 Word"}</button></footer>
+      </section>
     </div>;
   };
 
@@ -1000,24 +1126,24 @@ function App() {
     if (!mobileSheet) return null;
     const sheetTitle = mobileSheet === "menu" ? "更多" : mobileSheet === "new" ? "新建" : mobileSheet === "chapter" ? "章节操作" : mobileSheet === "point" ? "知识点操作" : mobileSheet === "placements" ? "所在章节" : "筛选";
     return <div className="mobile-sheet-backdrop" role="presentation" onClick={() => setMobileSheet(null)}><section className="mobile-sheet" role="dialog" aria-modal="true" aria-label={sheetTitle} onClick={(event) => event.stopPropagation()}><div className="mobile-sheet__handle" aria-hidden="true" /><div className="mobile-sheet__header"><h2>{sheetTitle}</h2><button type="button" className="mobile-text-button" onClick={() => setMobileSheet(null)}>关闭</button></div><div className="mobile-sheet__items">
-      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button><button type="button" onClick={() => { setMobileSheet(null); openRecycleBin(); }}>回收站</button></>}
+      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出</button><button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button><button type="button" onClick={() => { setMobileSheet(null); openRecycleBin(); }}>回收站</button></>}
       {mobileSheet === "new" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); createChapter(selectedChapter.id); }}>新建子章节</button><button type="button" onClick={() => { setMobileSheet(null); createKnowledgePoint(selectedChapter.id); }}>新建知识点</button></>}
-      {mobileSheet === "chapter" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); togglePin("chapter", selectedChapter.id); }}>{isPinned("chapter", selectedChapter.id) ? "取消置顶章节" : "置顶章节"}</button><button type="button" onClick={() => { setMobileSheet(null); renameChapter(selectedChapter); }}>重命名章节</button><button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteChapter(selectedChapter); }}>删除章节</button></>}
-      {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); beginPointEdit(); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); openHistory("shared"); }}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => { setMobileSheet(null); openHistory("placement"); }}>本章补充历史</button>}<button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
+      {mobileSheet === "chapter" && selectedChapter && <><button type="button" disabled={exportBusy} onClick={() => { setMobileSheet(null); void exportChapter(); }}>导出本章 Word</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("chapter", selectedChapter.id); }}>{isPinned("chapter", selectedChapter.id) ? "取消置顶章节" : "置顶章节"}</button><button type="button" onClick={() => { setMobileSheet(null); renameChapter(selectedChapter); }}>重命名章节</button><button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteChapter(selectedChapter); }}>删除章节</button></>}
+      {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" disabled={exportBusy} onClick={() => { setMobileSheet(null); void exportKnowledgePoint(); }}>导出 Word</button><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); beginPointEdit(); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); openHistory("shared"); }}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => { setMobileSheet(null); openHistory("placement"); }}>本章补充历史</button>}<button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
       {mobileSheet === "placements" && (selectedKnowledgePoint ? pointPlacementsForMobile(selectedKnowledgePoint) : []).map((placement) => <button type="button" key={placement.id} onClick={() => { setMobileSheet(null); selectKnowledgePoint(placement); }}>{chapterPath(placement.chapter_id)}{placement.id === selectedPlacement?.id ? " · 当前" : ""}</button>)}
       {mobileSheet === "filters" && <><button type="button" onClick={() => { setSearchTagId(""); setMobileSheet(null); }}>全部标签</button>{tags.map((tag) => <button type="button" key={tag.id} onClick={() => { setSearchTagId(tag.id); setMobileSheet(null); }}>{tag.name}{searchTagId === tag.id ? " · 当前" : ""}</button>)}</>}
     </div></section></div>;
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main>;
 
   if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
-    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>个人英语讲义工作台</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}</section></main>;
+    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>个人英语讲义工作台</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }
