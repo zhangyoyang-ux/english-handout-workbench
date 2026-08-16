@@ -29,7 +29,7 @@ for (const marker of [
   "阅读", "编辑", "上一篇", "下一篇", "返回目录", "保存失败",
   "AUTOSAVE_DELAY = 800", "localStorage", 'endpoint("content"',
 ]) contains(app, marker);
-assert.doesNotMatch(app, /dangerouslySetInnerHTML|搜索|Word 导出|图片上传|收藏|置顶/);
+assert.doesNotMatch(app, /dangerouslySetInnerHTML|Word 导出|图片上传/);
 
 const edge = read("supabase/functions/notes/index.ts");
 for (const marker of [

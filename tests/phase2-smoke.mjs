@@ -32,7 +32,7 @@ for (const marker of [
   "整理目录", "新建子章节名称", "新建知识点名称", "保存失败", "localStorage",
   "AUTOSAVE_DELAY = 800",
 ]) assert.match(app, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-assert.doesNotMatch(app, /搜索|Word 导出|图片上传|用户登录|自动备份/);
+assert.doesNotMatch(app, /Word 导出|图片上传|用户登录|自动备份/);
 
 const edge = read("supabase/functions/notes/index.ts");
 for (const marker of [

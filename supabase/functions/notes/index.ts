@@ -54,6 +54,25 @@ type KnowledgePointPlacement = {
   deleted_at: string | null;
 };
 
+type Tag = {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type SearchRow = {
+  point_id: string;
+  title: string;
+  status: KnowledgePoint["status"];
+  updated_at: string;
+  placement_id: string | null;
+  chapter_id: string | null;
+  match_type: string;
+  match_text: string | null;
+  tag_name: string | null;
+};
+
 type NotePayload = {
   id?: unknown;
   title?: unknown;
@@ -81,6 +100,15 @@ type KnowledgePointPayload = {
   inspiration?: unknown;
 };
 
+type TagPayload = {
+  name?: unknown;
+  knowledge_point_id?: unknown;
+  tag_id?: unknown;
+  favorite?: unknown;
+  item_type?: unknown;
+  item_id?: unknown;
+};
+
 type ReorderPayload = {
   parent_id?: unknown;
   chapter_id?: unknown;
@@ -90,6 +118,7 @@ type ReorderPayload = {
 const MAX_TITLE_LENGTH = 200;
 const MAX_CONTENT_LENGTH = 200_000;
 const MAX_RICH_DOCUMENT_LENGTH = 500_000;
+const MAX_TAG_LENGTH = 80;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUS_VALUES = new Set(["draft", "needs_improvement", "organized"]);
 const CONTENT_FIELDS = ["explanation", "exercises", "supplement", "inspiration"] as const;
@@ -219,6 +248,36 @@ function databaseError(request: Request, error: unknown, fallback: string) {
       error: { code: "KNOWLEDGE_POINT_SHARED", message: "该知识点仍被其他章节引用。" },
     });
   }
+  if (message.includes("PIN_LIMIT")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "PIN_LIMIT", message: "最多只能置顶 4 个项目。" },
+    });
+  }
+  if (message.includes("TAG_DUPLICATE")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "TAG_DUPLICATE", message: "这个标签已经添加到该知识点。" },
+    });
+  }
+  if (message.includes("PIN_DUPLICATE")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "PIN_DUPLICATE", message: "这个项目已经置顶。" },
+    });
+  }
+  if (message.includes("TAG_NOT_FOUND")) {
+    return json(request, 404, {
+      ok: false,
+      error: { code: "TAG_NOT_FOUND", message: "标签不存在。" },
+    });
+  }
+  if (message.includes("TAG_IN_USE")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "TAG_IN_USE", message: "这个标签仍被知识点使用。" },
+    });
+  }
 
   const validationCodes: Record<string, string> = {
     CHAPTER_TITLE_INVALID: "章节名称不能为空，且不能超过 200 个字符。",
@@ -230,6 +289,10 @@ function databaseError(request: Request, error: unknown, fallback: string) {
     PLACEMENT_NOT_FOUND: "知识点位置不存在。",
     CHAPTER_NOTE_INVALID: "本章补充内容格式无效。",
     CONTENT_PAYLOAD_INVALID: "知识点内容格式无效。",
+    TAG_NAME_INVALID: "标签名称不能为空，且不能超过 80 个字符。",
+    TAG_PAYLOAD_INVALID: "标签参数无效。",
+    FAVORITE_PAYLOAD_INVALID: "收藏参数无效。",
+    PIN_PAYLOAD_INVALID: "置顶参数无效。",
   };
   for (const [code, messageText] of Object.entries(validationCodes)) {
     if (message.includes(code)) {
@@ -707,6 +770,347 @@ async function reorderKnowledgePoints(client: SupabaseClient, payload: ReorderPa
   if (error) throw error;
 }
 
+function isTagName(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.trim().length <= MAX_TAG_LENGTH;
+}
+
+function isPinType(value: unknown): value is "chapter" | "knowledge_point" {
+  return value === "chapter" || value === "knowledge_point";
+}
+
+function readableDocumentText(value: unknown): string {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === "object") return readableDocumentText(parsed);
+    } catch {
+      return value;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(readableDocumentText).filter(Boolean).join(" ");
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  const text = typeof record.text === "string" ? record.text : "";
+  const content = readableDocumentText(record.content);
+  return [text, content].filter(Boolean).join(" ");
+}
+
+function makeSnippet(value: unknown, query: string) {
+  const text = readableDocumentText(value).replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const lowerText = text.toLocaleLowerCase();
+  const index = lowerText.indexOf(query.toLocaleLowerCase());
+  if (index < 0) return text.slice(0, 140);
+  const start = Math.max(0, index - 45);
+  const end = Math.min(text.length, index + query.length + 95);
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
+
+async function readTags(client: SupabaseClient) {
+  const { data, error } = await client
+    .from("tags")
+    .select("id,name,created_at,updated_at")
+    .order("name", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as Tag[];
+}
+
+async function readTagsForPoint(client: SupabaseClient, pointId: string) {
+  const { data: links, error: linkError } = await client
+    .from("knowledge_point_tags")
+    .select("tag_id")
+    .eq("knowledge_point_id", pointId);
+  if (linkError) throw linkError;
+  const tagIds = (links ?? []).map((link) => link.tag_id as string);
+  if (tagIds.length === 0) return [] as Tag[];
+  const { data, error } = await client
+    .from("tags")
+    .select("id,name,created_at,updated_at")
+    .in("id", tagIds)
+    .order("name", { ascending: true });
+  if (error) throw error;
+  return (data ?? []) as Tag[];
+}
+
+function chapterPath(chapters: Chapter[], chapterId: string | null) {
+  if (!chapterId) return "";
+  const byId = new Map(chapters.map((chapter) => [chapter.id, chapter]));
+  const names: string[] = [];
+  const seen = new Set<string>();
+  let current = byId.get(chapterId);
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    names.unshift(current.title);
+    current = current.parent_id ? byId.get(current.parent_id) : undefined;
+  }
+  return names.join(" → ");
+}
+
+async function readPointAccessContext(client: SupabaseClient, pointIds: string[]) {
+  const tree = await readTree(client);
+  const placements = tree.knowledge_point_placements.filter((placement) => pointIds.includes(placement.knowledge_point_id));
+  return { tree, placements };
+}
+
+async function readDiscoveryMeta(client: SupabaseClient, pointId: string) {
+  const point = await readKnowledgePoint(client, pointId);
+  if (point.error) throw point.error;
+  if (!point.data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+
+  const [tags, favoriteResult, pinResult] = await Promise.all([
+    readTagsForPoint(client, pointId),
+    client.from("favorite_items").select("knowledge_point_id").eq("knowledge_point_id", pointId).maybeSingle(),
+    client.from("pinned_items").select("id,item_type,item_id,sort_order,created_at").eq("item_type", "knowledge_point").eq("item_id", pointId).maybeSingle(),
+  ]);
+  if (favoriteResult.error) throw favoriteResult.error;
+  if (pinResult.error) throw pinResult.error;
+  return {
+    knowledge_point: point.data as KnowledgePoint,
+    tags,
+    favorite: Boolean(favoriteResult.data),
+    pinned: (pinResult.data ?? null),
+  };
+}
+
+async function readFastAccess(client: SupabaseClient) {
+  const [recentResult, favoriteResult, pinResult, tree] = await Promise.all([
+    client.rpc("recent_workbench_edits", { p_limit: 6 }),
+    client.from("favorite_items").select("knowledge_point_id,created_at").order("created_at", { ascending: false }),
+    client.from("pinned_items").select("id,item_type,item_id,sort_order,created_at").order("sort_order", { ascending: true }).order("created_at", { ascending: true }),
+    readTree(client),
+  ]);
+  if (recentResult.error) throw recentResult.error;
+  if (favoriteResult.error) throw favoriteResult.error;
+  if (pinResult.error) throw pinResult.error;
+
+  const pointMap = new Map(tree.knowledge_points.map((point) => [point.id, point]));
+  const chapterMap = new Map(tree.chapters.map((chapter) => [chapter.id, chapter]));
+  const placementsByPoint = new Map<string, KnowledgePointPlacement[]>();
+  for (const placement of tree.knowledge_point_placements) {
+    const existing = placementsByPoint.get(placement.knowledge_point_id) ?? [];
+    existing.push(placement);
+    placementsByPoint.set(placement.knowledge_point_id, existing);
+  }
+  const accessItem = (itemType: string, itemId: string, updatedAt: string | null = null) => {
+    const point = itemType === "knowledge_point" ? pointMap.get(itemId) : null;
+    const chapter = itemType === "chapter" ? chapterMap.get(itemId) : null;
+    const placement = point ? placementsByPoint.get(point.id)?.[0] : null;
+    const chapterId = chapter?.id ?? placement?.chapter_id ?? null;
+    return {
+      item_type: itemType,
+      item_id: itemId,
+      title: point?.title ?? chapter?.title ?? "",
+      status: point?.status ?? null,
+      updated_at: updatedAt ?? point?.updated_at ?? chapter?.updated_at ?? null,
+      chapter_id: chapterId,
+      placement_id: placement?.id ?? null,
+      path: chapterPath(tree.chapters, chapterId),
+    };
+  };
+
+  const recent = (recentResult.data ?? [])
+    .map((item) => accessItem(item.item_type, item.item_id, item.updated_at))
+    .filter((item) => item.title);
+  const favorites = (favoriteResult.data ?? [])
+    .map((item) => accessItem("knowledge_point", item.knowledge_point_id, item.created_at))
+    .filter((item) => item.title);
+  const pins = (pinResult.data ?? [])
+    .map((item) => ({ ...item, ...accessItem(item.item_type, item.item_id) }))
+    .filter((item) => item.title);
+  return { recent, favorites, pins };
+}
+
+async function searchKnowledgePoints(client: SupabaseClient, query: string, status: string | null, tagId: string | null) {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) return [];
+  if (status !== null && !STATUS_VALUES.has(status)) throw new Error("KNOWLEDGE_POINT_STATUS_INVALID");
+  if (tagId !== null && !isUuid(tagId)) throw new Error("TAG_PAYLOAD_INVALID");
+
+  const { data, error } = await client.rpc("search_workbench", {
+    p_query: trimmedQuery,
+    p_status: status,
+    p_tag_id: tagId,
+  });
+  if (error) throw error;
+  const rows = (data ?? []) as SearchRow[];
+  if (rows.length === 0) return [];
+
+  const pointIds = [...new Set(rows.map((row) => row.point_id))];
+  const { tree, placements } = await readPointAccessContext(client, pointIds);
+  const tagsByPoint = new Map<string, Tag[]>();
+  await Promise.all(pointIds.map(async (pointId) => { tagsByPoint.set(pointId, await readTagsForPoint(client, pointId)); }));
+  const grouped = new Map<string, {
+    id: string;
+    title: string;
+    status: string;
+    updated_at: string;
+    match_types: string[];
+    contexts: Array<{ type: string; text: string; chapter_id: string | null; placement_id: string | null; path: string }>;
+    chapter_id: string | null;
+    placement_id: string | null;
+  }>();
+
+  for (const row of rows) {
+    const pointPlacements = placements.filter((placement) => placement.knowledge_point_id === row.point_id);
+    const preferredPlacement = row.placement_id
+      ? pointPlacements.find((placement) => placement.id === row.placement_id)
+      : pointPlacements[0];
+    const chapterId = row.chapter_id ?? preferredPlacement?.chapter_id ?? null;
+    const placementId = row.placement_id ?? preferredPlacement?.id ?? null;
+    const current = grouped.get(row.point_id) ?? {
+      id: row.point_id,
+      title: row.title,
+      status: row.status,
+      updated_at: row.updated_at,
+      match_types: [],
+      contexts: [],
+      chapter_id: chapterId,
+      placement_id: placementId,
+    };
+    if (!current.match_types.includes(row.match_type)) current.match_types.push(row.match_type);
+    const context = makeSnippet(row.match_text, trimmedQuery);
+    if (context && !current.contexts.some((item) => item.type === row.match_type && item.text === context)) {
+      current.contexts.push({
+        type: row.match_type,
+        text: context,
+        chapter_id: chapterId,
+        placement_id: placementId,
+        path: chapterPath(tree.chapters, chapterId),
+      });
+    }
+    grouped.set(row.point_id, current);
+  }
+
+  const priority: Record<string, number> = { title: 0, explanation: 1, exercises: 2, supplement: 3, inspiration: 4, chapter_note: 5, tag: 6 };
+  return [...grouped.values()]
+    .map((item) => ({
+      ...item,
+      paths: [...new Set(placements.filter((placement) => placement.knowledge_point_id === item.id).map((placement) => chapterPath(tree.chapters, placement.chapter_id)).filter(Boolean))],
+      tags: tagsByPoint.get(item.id) ?? [],
+      context: [...item.contexts].sort((left, right) => (priority[left.type] ?? 99) - (priority[right.type] ?? 99))[0] ?? null,
+    }))
+    .sort((left, right) => {
+      const leftPriority = Math.min(...left.match_types.map((type) => priority[type] ?? 99));
+      const rightPriority = Math.min(...right.match_types.map((type) => priority[type] ?? 99));
+      return leftPriority - rightPriority || right.updated_at.localeCompare(left.updated_at);
+    });
+}
+
+async function createTag(client: SupabaseClient, name: unknown) {
+  if (!isTagName(name)) throw new Error("TAG_NAME_INVALID");
+  const trimmed = name.trim();
+  const { data: existing, error: existingError } = await client
+    .from("tags")
+    .select("id,name,created_at,updated_at")
+    .ilike("name", trimmed)
+    .limit(1)
+    .maybeSingle();
+  if (existingError) throw existingError;
+  if (existing) return { tag: existing as Tag, created: false };
+  const { data, error } = await client
+    .from("tags")
+    .insert({ name: trimmed })
+    .select("id,name,created_at,updated_at")
+    .single();
+  if (error) throw error;
+  return { tag: data as Tag, created: true };
+}
+
+async function renameTag(client: SupabaseClient, id: string, name: unknown) {
+  if (!isUuid(id)) throw new Error("TAG_NOT_FOUND");
+  if (!isTagName(name)) throw new Error("TAG_NAME_INVALID");
+  const { data, error } = await client
+    .from("tags")
+    .update({ name: name.trim() })
+    .eq("id", id)
+    .select("id,name,created_at,updated_at")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("TAG_NOT_FOUND");
+  return data as Tag;
+}
+
+async function deleteTag(client: SupabaseClient, id: string) {
+  if (!isUuid(id)) throw new Error("TAG_NOT_FOUND");
+  const { count, error: linkError } = await client
+    .from("knowledge_point_tags")
+    .select("tag_id", { count: "exact", head: true })
+    .eq("tag_id", id);
+  if (linkError) throw linkError;
+  if ((count ?? 0) > 0) throw new Error("TAG_IN_USE");
+  const { data, error } = await client.from("tags").delete().eq("id", id).select("id").maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("TAG_NOT_FOUND");
+}
+
+async function attachTag(client: SupabaseClient, pointId: string, tagId: string) {
+  if (!isUuid(pointId) || !isUuid(tagId)) throw new Error("TAG_PAYLOAD_INVALID");
+  const point = await readKnowledgePoint(client, pointId);
+  if (point.error) throw point.error;
+  if (!point.data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+  const { data: tag, error: tagError } = await client.from("tags").select("id").eq("id", tagId).maybeSingle();
+  if (tagError) throw tagError;
+  if (!tag) throw new Error("TAG_NOT_FOUND");
+  const { error } = await client.from("knowledge_point_tags").insert({ knowledge_point_id: pointId, tag_id: tagId });
+  if (error) {
+    if (error.code === "23505") throw new Error("TAG_DUPLICATE");
+    throw error;
+  }
+  return readTagsForPoint(client, pointId);
+}
+
+async function detachTag(client: SupabaseClient, pointId: string, tagId: string) {
+  if (!isUuid(pointId) || !isUuid(tagId)) throw new Error("TAG_PAYLOAD_INVALID");
+  const { error } = await client.from("knowledge_point_tags").delete().eq("knowledge_point_id", pointId).eq("tag_id", tagId);
+  if (error) throw error;
+  return readTagsForPoint(client, pointId);
+}
+
+async function setFavorite(client: SupabaseClient, pointId: string, favorite: boolean) {
+  if (!isUuid(pointId)) throw new Error("FAVORITE_PAYLOAD_INVALID");
+  const point = await readKnowledgePoint(client, pointId);
+  if (point.error) throw point.error;
+  if (!point.data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+  if (favorite) {
+    const { error } = await client.from("favorite_items").upsert({ knowledge_point_id: pointId }, { onConflict: "knowledge_point_id" });
+    if (error) throw error;
+  } else {
+    const { error } = await client.from("favorite_items").delete().eq("knowledge_point_id", pointId);
+    if (error) throw error;
+  }
+  return { favorite };
+}
+
+async function setPin(client: SupabaseClient, itemType: "chapter" | "knowledge_point", itemId: string) {
+  if (!isUuid(itemId)) throw new Error("PIN_PAYLOAD_INVALID");
+  const existing = await client.from("pinned_items").select("id").eq("item_type", itemType).eq("item_id", itemId).maybeSingle();
+  if (existing.error) throw existing.error;
+  if (existing.data) throw new Error("PIN_DUPLICATE");
+  const active = itemType === "chapter" ? await readChapter(client, itemId) : await readKnowledgePoint(client, itemId);
+  if (active.error) throw active.error;
+  if (!active.data) throw new Error(itemType === "chapter" ? "CHAPTER_NOT_FOUND" : "KNOWLEDGE_POINT_NOT_FOUND");
+  const { count, error: countError } = await client.from("pinned_items").select("id", { count: "exact", head: true });
+  if (countError) throw countError;
+  if ((count ?? 0) >= 4) throw new Error("PIN_LIMIT");
+  const { data, error } = await client
+    .from("pinned_items")
+    .insert({ item_type: itemType, item_id: itemId, sort_order: count ?? 0 })
+    .select("id,item_type,item_id,sort_order,created_at")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function removePin(client: SupabaseClient, itemType: string | null, itemId: string | null, pinId: string | null) {
+  let query = client.from("pinned_items").delete();
+  if (isUuid(pinId)) query = query.eq("id", pinId);
+  else if (isPinType(itemType) && isUuid(itemId)) query = query.eq("item_type", itemType).eq("item_id", itemId);
+  else throw new Error("PIN_PAYLOAD_INVALID");
+  const { error } = await query;
+  if (error) throw error;
+}
+
 async function handleNote(request: Request, client: SupabaseClient) {
   if (request.method === "GET") {
     const { data, error } = await readLatestNote(client);
@@ -754,6 +1158,120 @@ async function handleNote(request: Request, client: SupabaseClient) {
 }
 
 async function handlePhase2(request: Request, client: SupabaseClient, resource: string) {
+  if (request.method === "GET" && resource === "search") {
+    const url = new URL(request.url);
+    const query = url.searchParams.get("q") ?? "";
+    const status = url.searchParams.get("status");
+    const tagId = url.searchParams.get("tag_id");
+    try {
+      return json(request, 200, { ok: true, query: query.trim(), results: await searchKnowledgePoints(client, query, status, tagId) });
+    } catch (error) {
+      return databaseError(request, error, "搜索失败，请稍后重试。");
+    }
+  }
+
+  if (request.method === "GET" && resource === "tags") {
+    return json(request, 200, { ok: true, tags: await readTags(client) });
+  }
+
+  if (request.method === "GET" && resource === "discovery_meta") {
+    const id = new URL(request.url).searchParams.get("id");
+    if (!isUuid(id)) return validationError(request, "知识点快速访问参数无效。");
+    return json(request, 200, { ok: true, ...(await readDiscoveryMeta(client, id)) });
+  }
+
+  if (request.method === "GET" && resource === "fast_access") {
+    return json(request, 200, { ok: true, ...(await readFastAccess(client)) });
+  }
+
+  if (request.method === "POST" && resource === "tag") {
+    const payload = await parseBody(request) as TagPayload | null;
+    if (!payload) return validationError(request, "请求内容不是有效 JSON。");
+    try {
+      return json(request, 201, { ok: true, ...(await createTag(client, payload.name)) });
+    } catch (error) {
+      return databaseError(request, error, "标签创建失败。");
+    }
+  }
+
+  if (request.method === "PATCH" && resource === "tag") {
+    const id = new URL(request.url).searchParams.get("id");
+    const payload = await parseBody(request) as TagPayload | null;
+    if (!payload || !isUuid(id)) return validationError(request, "标签参数无效。");
+    try {
+      return json(request, 200, { ok: true, tag: await renameTag(client, id, payload.name) });
+    } catch (error) {
+      return databaseError(request, error, "标签更新失败。");
+    }
+  }
+
+  if (request.method === "DELETE" && resource === "tag") {
+    const id = new URL(request.url).searchParams.get("id");
+    try {
+      await deleteTag(client, id ?? "");
+      return json(request, 200, { ok: true, deleted: true });
+    } catch (error) {
+      return databaseError(request, error, "标签删除失败。");
+    }
+  }
+
+  if (request.method === "POST" && resource === "knowledge_point_tag") {
+    const payload = await parseBody(request) as TagPayload | null;
+    if (!payload || !isUuid(payload.knowledge_point_id) || !isUuid(payload.tag_id)) {
+      return validationError(request, "知识点标签参数无效。");
+    }
+    try {
+      return json(request, 201, { ok: true, tags: await attachTag(client, payload.knowledge_point_id, payload.tag_id) });
+    } catch (error) {
+      return databaseError(request, error, "添加标签失败。");
+    }
+  }
+
+  if (request.method === "DELETE" && resource === "knowledge_point_tag") {
+    const url = new URL(request.url);
+    const pointId = url.searchParams.get("knowledge_point_id");
+    const tagId = url.searchParams.get("tag_id");
+    try {
+      return json(request, 200, { ok: true, tags: await detachTag(client, pointId ?? "", tagId ?? "") });
+    } catch (error) {
+      return databaseError(request, error, "移除标签失败。");
+    }
+  }
+
+  if (request.method === "PATCH" && resource === "favorite") {
+    const payload = await parseBody(request) as TagPayload | null;
+    if (!payload || !isUuid(payload.knowledge_point_id) || typeof payload.favorite !== "boolean") {
+      return validationError(request, "收藏参数无效。");
+    }
+    try {
+      return json(request, 200, { ok: true, ...(await setFavorite(client, payload.knowledge_point_id, payload.favorite)) });
+    } catch (error) {
+      return databaseError(request, error, "收藏状态更新失败。");
+    }
+  }
+
+  if (request.method === "POST" && resource === "pin") {
+    const payload = await parseBody(request) as TagPayload | null;
+    if (!payload || !isPinType(payload.item_type) || !isUuid(payload.item_id)) {
+      return validationError(request, "置顶参数无效。");
+    }
+    try {
+      return json(request, 201, { ok: true, pinned: await setPin(client, payload.item_type, payload.item_id) });
+    } catch (error) {
+      return databaseError(request, error, "置顶失败。");
+    }
+  }
+
+  if (request.method === "DELETE" && resource === "pin") {
+    const url = new URL(request.url);
+    try {
+      await removePin(client, url.searchParams.get("item_type"), url.searchParams.get("item_id"), url.searchParams.get("id"));
+      return json(request, 200, { ok: true });
+    } catch (error) {
+      return databaseError(request, error, "取消置顶失败。");
+    }
+  }
+
   if (request.method === "GET" && resource === "tree") {
     return json(request, 200, { ok: true, ...(await readTree(client)) });
   }

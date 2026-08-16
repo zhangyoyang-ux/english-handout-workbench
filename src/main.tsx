@@ -77,6 +77,41 @@ type Selection = {
   knowledgePointId?: string;
 };
 
+type Tag = {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type AccessItem = {
+  item_type: "chapter" | "knowledge_point";
+  item_id: string;
+  title: string;
+  status: PointStatus | null;
+  updated_at: string | null;
+  chapter_id: string | null;
+  placement_id: string | null;
+  path: string;
+};
+
+type PinItem = AccessItem & { id: string; sort_order: number; created_at: string };
+type SearchContext = { type: string; text: string; path: string; chapter_id: string | null; placement_id: string | null };
+type SearchResult = {
+  id: string;
+  title: string;
+  status: PointStatus;
+  updated_at: string;
+  match_types: string[];
+  context: SearchContext | null;
+  paths: string[];
+  tags: Tag[];
+  chapter_id: string | null;
+  placement_id: string | null;
+};
+type DiscoveryMeta = { tags: Tag[]; favorite: boolean; pinned: { id: string } | null };
+type FastAccess = { recent: AccessItem[]; favorites: AccessItem[]; pins: PinItem[] };
+
 const EMPTY_TREE: TreeData = { chapters: [], knowledge_points: [], knowledge_point_placements: [] };
 const AUTOSAVE_DELAY = 800;
 const EXPANDED_KEY = "english-handout-workbench:phase2:expanded";
@@ -154,6 +189,7 @@ function readExpandedIds() {
 }
 function saveStateLabel(state: SaveState) { return { idle: "等待编辑", dirty: "待保存", saving: "保存中", saved: "已保存", error: "保存失败" }[state]; }
 function pointStatusLabel(status: PointStatus) { return POINT_STATUS_LABELS[status]; }
+function matchTypeLabel(type: string) { return ({ title: "标题命中", explanation: "知识讲解命中", exercises: "例题命中", supplement: "补充内容命中", inspiration: "灵感命中", chapter_note: "本章补充命中", tag: "标签命中" } as Record<string, string>)[type] ?? type; }
 function sortByOrder<T extends { sort_order: number; created_at: string }>(items: T[]) { return [...items].sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at)); }
 
 function SaveBadge({ state }: { state: SaveState }) {
@@ -218,6 +254,18 @@ function App() {
   const [referenceBusy, setReferenceBusy] = useState(false);
   const [draggedChapterId, setDraggedChapterId] = useState<string | null>(null);
   const [draggedPlacementId, setDraggedPlacementId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchStatus, setSearchStatus] = useState<"" | PointStatus>("");
+  const [searchTagId, setSearchTagId] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [fastAccess, setFastAccess] = useState<FastAccess>({ recent: [], favorites: [], pins: [] });
+  const [pointMeta, setPointMeta] = useState<DiscoveryMeta | null>(null);
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
+  const [customTagDraft, setCustomTagDraft] = useState("");
+  const [fastAccessLoading, setFastAccessLoading] = useState(false);
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const contentVersionRef = useRef(0);
@@ -240,9 +288,28 @@ function App() {
     } else if (selection?.chapterId) {
       setSelectedKnowledgePointId(null); setSelectedChapterId(selection.chapterId);
     } else {
-      setSelectedChapterId((current) => current && result.chapters.some((chapter) => chapter.id === current) ? current : result.chapters.find((chapter) => chapter.parent_id === null)?.id ?? result.chapters[0]?.id ?? null);
+      setSelectedKnowledgePointId(null);
+      setSelectedChapterId(null);
     }
   }, []);
+
+  const loadFastAccess = useCallback(async () => {
+    setFastAccessLoading(true);
+    try {
+      const [tagResult, accessResult] = await Promise.all([
+        requestJson<{ ok: true; tags: Tag[] }>(endpoint("tags")),
+        requestJson<{ ok: true } & FastAccess>(endpoint("fast_access")),
+      ]);
+      setTags(tagResult.tags ?? []);
+      setFastAccess({ recent: accessResult.recent ?? [], favorites: accessResult.favorites ?? [], pins: accessResult.pins ?? [] });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "快速访问内容读取失败。");
+    } finally {
+      setFastAccessLoading(false);
+    }
+  }, []);
+
+  const refreshFastAccess = useCallback(() => { void loadFastAccess(); }, [loadFastAccess]);
 
   useEffect(() => {
     let cancelled = false;
@@ -250,7 +317,29 @@ function App() {
     void loadTree().catch((error) => { if (!cancelled) setMessage(error instanceof Error ? error.message : "目录读取失败。"); }).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [loadTree]);
+  useEffect(() => { void loadFastAccess(); }, [loadFastAccess]);
   useEffect(() => { try { window.localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expandedIds])); } catch { /* Optional UI state. */ } }, [expandedIds]);
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResults([]);
+      setSearchError("");
+      setSearchLoading(false);
+      return;
+    }
+    setSearchLoading(true);
+    setSearchError("");
+    const timer = window.setTimeout(() => {
+      const params: Record<string, string> = { q: query };
+      if (searchStatus) params.status = searchStatus;
+      if (searchTagId) params.tag_id = searchTagId;
+      void requestJson<{ ok: true; results: SearchResult[] }>(endpoint("search", params))
+        .then((result) => setSearchResults(result.results ?? []))
+        .catch((error) => { setSearchResults([]); setSearchError(error instanceof Error ? error.message : "搜索失败，请稍后重试。"); })
+        .finally(() => setSearchLoading(false));
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery, searchStatus, searchTagId]);
   useEffect(() => {
     if (!selectedChapterId) return;
     const ancestors = new Set<string>(); let current = chapterMap.get(selectedChapterId);
@@ -267,12 +356,12 @@ function App() {
       setSaveState("saving"); setMessage("");
       try {
         await requestJson(endpoint("chapter", { id: selectedChapter.id }), { method: "PATCH", body: JSON.stringify({ content: selectedChapter.content }) });
-        setSaveState("saved"); setMessage("章节内容已保存到 Supabase PostgreSQL。");
+        setSaveState("saved"); setMessage("章节内容已保存到 Supabase PostgreSQL。"); refreshFastAccess();
         try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
       } catch (error) { setSaveState("error"); setMessage(`保存失败，章节内容已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`); }
     }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [selectedChapter, selectedKnowledgePointId]);
+  }, [selectedChapter, selectedKnowledgePointId, refreshFastAccess]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
@@ -285,6 +374,14 @@ function App() {
       .then((result) => { if (requestId !== contentRequestRef.current) return; setContentRecord(result.content); setContentDraft(contentDraftFromRecord(result.content)); setTitleDraft(result.knowledge_point.title); })
       .catch((error) => { if (requestId !== contentRequestRef.current) return; setSaveState("error"); setMessage(`知识点内容读取失败：${error instanceof Error ? error.message : "网络连接异常。"}`); })
       .finally(() => { if (requestId === contentRequestRef.current) setContentLoading(false); });
+  }, [selectedKnowledgePointId]);
+
+  useEffect(() => {
+    const pointId = selectedKnowledgePointId;
+    if (!pointId) { setPointMeta(null); setTagPickerOpen(false); return; }
+    void requestJson<{ ok: true } & DiscoveryMeta>(endpoint("discovery_meta", { id: pointId }))
+      .then((result) => setPointMeta({ tags: result.tags ?? [], favorite: result.favorite, pinned: result.pinned ?? null }))
+      .catch((error) => setMessage(error instanceof Error ? error.message : "知识点快速访问信息读取失败。"));
   }, [selectedKnowledgePointId]);
 
   useEffect(() => {
@@ -307,12 +404,12 @@ function App() {
       setSaveState("saving"); setMessage("");
       void requestJson<{ ok: true; content: KnowledgePointContent }>(endpoint("content", { id: pointId }), { method: "PATCH", body: JSON.stringify(payload) }).then((result) => {
         if (pointId !== selectedKnowledgePointId || versionAtSchedule !== contentVersionRef.current) return;
-        setContentRecord(result.content); pendingContentFieldsRef.current.clear(); setContentDirty(false); setSaveState(chapterNoteDirty ? "dirty" : "saved"); setMessage("共享核心已保存到 Supabase PostgreSQL。");
+        setContentRecord(result.content); pendingContentFieldsRef.current.clear(); setContentDirty(false); setSaveState(chapterNoteDirty ? "dirty" : "saved"); setMessage("共享核心已保存到 Supabase PostgreSQL。"); refreshFastAccess();
         try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
       }).catch((error) => { if (pointId === selectedKnowledgePointId) { setSaveState("error"); setMessage(`保存失败，当前输入已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`); } });
     }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [contentDraft, contentDirty, selectedKnowledgePointId, chapterNoteDirty]);
+  }, [contentDraft, contentDirty, selectedKnowledgePointId, chapterNoteDirty, refreshFastAccess]);
 
   useEffect(() => {
     const placementId = selectedPlacementId;
@@ -334,6 +431,7 @@ function App() {
         setChapterNoteDirty(false);
         setSaveState(contentDirty ? "dirty" : "saved");
         setMessage("本章补充已保存到 Supabase PostgreSQL。");
+        refreshFastAccess();
         try { window.localStorage.removeItem(draftKey); } catch { /* Best-effort cleanup. */ }
       }).catch((error) => {
         if (selectedPlacementId !== placementId) return;
@@ -342,14 +440,80 @@ function App() {
       });
     }, AUTOSAVE_DELAY);
     return () => window.clearTimeout(timer);
-  }, [chapterNoteDraft, chapterNoteDirty, selectedPlacementId, contentDirty]);
+  }, [chapterNoteDraft, chapterNoteDirty, selectedPlacementId, contentDirty, refreshFastAccess]);
 
   const childrenOf = (parentId: string | null) => sortByOrder(tree.chapters.filter((chapter) => chapter.parent_id === parentId));
   const placementsOf = (chapterId: string) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.chapter_id === chapterId));
   const selectChapter = (chapterId: string) => { setSelectedChapterId(chapterId); setSelectedKnowledgePointId(null); setViewMode("read"); };
   const selectKnowledgePoint = (placement: Placement) => { setSelectedChapterId(placement.chapter_id); setSelectedKnowledgePointId(placement.knowledge_point_id); setViewMode("read"); };
+  const openAccessItem = (item: Pick<AccessItem, "item_type" | "item_id" | "chapter_id" | "placement_id">) => {
+    setSearchQuery("");
+    if (item.item_type === "chapter") {
+      selectChapter(item.item_id);
+      return;
+    }
+    const placement = tree.knowledge_point_placements.find((candidate) => candidate.id === item.placement_id)
+      ?? tree.knowledge_point_placements.find((candidate) => candidate.knowledge_point_id === item.item_id && candidate.chapter_id === item.chapter_id)
+      ?? tree.knowledge_point_placements.find((candidate) => candidate.knowledge_point_id === item.item_id);
+    if (placement) selectKnowledgePoint(placement);
+    else { setSelectedChapterId(item.chapter_id); setSelectedKnowledgePointId(item.item_id); setViewMode("read"); }
+  };
+  const openSearchResult = (result: SearchResult) => {
+    const contextPlacementId = result.context?.placement_id ?? result.placement_id;
+    openAccessItem({ item_type: "knowledge_point", item_id: result.id, chapter_id: result.context?.chapter_id ?? result.chapter_id, placement_id: contextPlacementId });
+  };
   const toggleExpanded = (chapterId: string) => setExpandedIds((previous) => { const next = new Set(previous); if (next.has(chapterId)) next.delete(chapterId); else next.add(chapterId); return next; });
   const mutate = async (action: () => Promise<void>) => { if (busy) return; setBusy(true); try { await action(); } catch (error) { setMessage(error instanceof Error ? error.message : "操作失败，请稍后重试。"); } finally { setBusy(false); } };
+
+  const toggleFavorite = () => {
+    if (!selectedKnowledgePoint || !pointMeta) return;
+    void mutate(async () => {
+      const favorite = !pointMeta.favorite;
+      await requestJson(endpoint("favorite"), { method: "PATCH", body: JSON.stringify({ knowledge_point_id: selectedKnowledgePoint.id, favorite }) });
+      setPointMeta((previous) => previous ? { ...previous, favorite } : previous);
+      refreshFastAccess();
+      setMessage(favorite ? "已加入收藏。" : "已取消收藏。");
+    });
+  };
+  const isPinned = (itemType: "chapter" | "knowledge_point", itemId: string) => fastAccess.pins.some((pin) => pin.item_type === itemType && pin.item_id === itemId);
+  const togglePin = (itemType: "chapter" | "knowledge_point", itemId: string) => void mutate(async () => {
+    const current = fastAccess.pins.find((pin) => pin.item_type === itemType && pin.item_id === itemId);
+    if (current) await requestJson(endpoint("pin", { id: current.id }), { method: "DELETE" });
+    else await requestJson(endpoint("pin"), { method: "POST", body: JSON.stringify({ item_type: itemType, item_id: itemId }) });
+    await loadFastAccess();
+    if (itemType === "knowledge_point" && selectedKnowledgePointId === itemId) {
+      const result = await requestJson<{ ok: true } & DiscoveryMeta>(endpoint("discovery_meta", { id: itemId }));
+      setPointMeta({ tags: result.tags ?? [], favorite: result.favorite, pinned: result.pinned ?? null });
+    }
+    setMessage(current ? "已取消置顶。" : "已置顶。最多保留 4 个项目。");
+  });
+  const togglePointTag = (tag: Tag) => {
+    if (!selectedKnowledgePoint || !pointMeta) return;
+    void mutate(async () => {
+      const attached = pointMeta.tags.some((item) => item.id === tag.id);
+      const result = await requestJson<{ ok: true; tags: Tag[] }>(
+        attached ? endpoint("knowledge_point_tag", { knowledge_point_id: selectedKnowledgePoint.id, tag_id: tag.id }) : endpoint("knowledge_point_tag"),
+        attached
+          ? { method: "DELETE" }
+          : { method: "POST", body: JSON.stringify({ knowledge_point_id: selectedKnowledgePoint.id, tag_id: tag.id }) },
+      );
+      setPointMeta((previous) => previous ? { ...previous, tags: result.tags ?? [] } : previous);
+      refreshFastAccess();
+    });
+  };
+  const createCustomTag = () => {
+    if (!selectedKnowledgePoint || !customTagDraft.trim()) return;
+    void mutate(async () => {
+      const result = await requestJson<{ ok: true; tag: Tag }>(endpoint("tag"), { method: "POST", body: JSON.stringify({ name: customTagDraft.trim() }) });
+      setTags((previous) => previous.some((tag) => tag.id === result.tag.id) ? previous : [...previous, result.tag].sort((left, right) => left.name.localeCompare(right.name, "zh-CN")));
+      if (!pointMeta?.tags.some((tag) => tag.id === result.tag.id)) {
+        const attached = await requestJson<{ ok: true; tags: Tag[] }>(endpoint("knowledge_point_tag"), { method: "POST", body: JSON.stringify({ knowledge_point_id: selectedKnowledgePoint.id, tag_id: result.tag.id }) });
+        setPointMeta((previous) => previous ? { ...previous, tags: attached.tags ?? [] } : previous);
+      }
+      setCustomTagDraft("");
+      setMessage("自定义标签已添加。");
+    });
+  };
 
   const createChapter = (parentId: string | null) => {
     const title = window.prompt(parentId ? "新建子章节名称" : "新建一级章节名称", ""); if (title === null || !title.trim()) return;
@@ -455,6 +619,20 @@ function App() {
     </div>;
   };
 
+  const renderAccessButton = (item: AccessItem, label?: string) => <button type="button" className="access-item" key={`${item.item_type}-${item.item_id}`} onClick={() => openAccessItem(item)}><span className="access-item__type">{label ?? (item.item_type === "chapter" ? "章节" : "知识点")}</span><span className="access-item__title">{item.title}</span>{item.path && <span className="access-item__path">{item.path}</span>}{item.status && <span className="status-pill">{pointStatusLabel(item.status)}</span>}</button>;
+
+  const renderHomeContent = () => {
+    const continueItem = fastAccess.recent[0];
+    return <div className="home-panel">
+      <div className="content-heading"><div><p className="content-kicker">个人工作台</p><h2>继续整理</h2><p className="content-hint">搜索、最近编辑和常用入口都集中在这里。</p></div><span className="home-mark">✦</span></div>
+      {fastAccessLoading && <p className="empty-line">正在读取快速访问……</p>}
+      {!fastAccessLoading && continueItem && <section className="fast-section fast-section--continue"><div className="fast-section__heading"><h3>继续整理</h3><span>最近一次真实编辑</span></div>{renderAccessButton(continueItem, "继续")}</section>}
+      <section className="fast-section"><div className="fast-section__heading"><h3>置顶</h3><span>最多 4 个</span></div>{fastAccess.pins.length === 0 ? <p className="empty-line">还没有置顶项目。</p> : <div className="access-list">{fastAccess.pins.map((item) => renderAccessButton(item, "置顶"))}</div>}</section>
+      <section className="fast-section"><div className="fast-section__heading"><h3>最近编辑</h3><span>最多 6 条</span></div>{fastAccess.recent.length === 0 ? <p className="empty-line">还没有最近编辑记录。</p> : <div className="access-list">{fastAccess.recent.map((item) => renderAccessButton(item))}</div>}</section>
+      <section className="fast-section"><div className="fast-section__heading"><h3>收藏</h3><span>{fastAccess.favorites.length} 条</span></div>{fastAccess.favorites.length === 0 ? <p className="empty-line">收藏的知识点会显示在这里。</p> : <div className="access-list">{fastAccess.favorites.map((item) => renderAccessButton(item, "收藏"))}</div>}</section>
+    </div>;
+  };
+
   const renderPoint = (placement: Placement) => {
     const point = pointMap.get(placement.knowledge_point_id); if (!point) return null;
     return <div className={`tree-point ${selectedKnowledgePointId === point.id ? "tree-point--selected" : ""}`} key={placement.id} draggable={organizeMode} onDragStart={(event) => { setDraggedPlacementId(placement.id); event.dataTransfer.setData("placement-id", placement.id); }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => handlePointDrop(event, placement)}>
@@ -474,7 +652,7 @@ function App() {
     if (!selectedChapter) return <EmptyState onCreateRoot={() => createChapter(null)} />;
     const children = childrenOf(selectedChapter.id); const placements = placementsOf(selectedChapter.id);
     return <><div className="content-heading"><div><p className="content-kicker">章节</p><h2>{selectedChapter.title}</h2><p className="content-hint">章节可以拥有自己的总览内容，也可以继续包含任意层级的子章节。</p></div><SaveBadge state={saveState} /></div>
-      <div className="action-row"><button className="primary-button" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button><button className="secondary-button" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button>{organizeMode && <><button className="quiet-button" disabled={busy} onClick={() => renameChapter(selectedChapter)}>重命名</button><button className="danger-button" disabled={busy} onClick={() => deleteChapter(selectedChapter)}>删除</button></>}</div>
+      <div className="action-row"><button className="primary-button" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button><button className="secondary-button" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button><button className="quiet-button" disabled={busy} onClick={() => togglePin("chapter", selectedChapter.id)}>{isPinned("chapter", selectedChapter.id) ? "取消置顶" : "置顶章节"}</button>{organizeMode && <><button className="quiet-button" disabled={busy} onClick={() => renameChapter(selectedChapter)}>重命名</button><button className="danger-button" disabled={busy} onClick={() => deleteChapter(selectedChapter)}>删除</button></>}</div>
       {organizeMode && <div className="move-panel"><label htmlFor="chapter-move">移动章节到</label><select id="chapter-move" value={selectedChapter.parent_id ?? ""} disabled={busy} onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}><option value="">一级目录</option>{possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{parent.title}</option>)}</select></div>}
       <label className="section-label" htmlFor="chapter-content">章节内容</label><textarea id="chapter-content" className="chapter-content-input" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="在这里写下本章节的总览、学习顺序或注意事项……" />
       <div className="subsection-grid"><section className="subsection-card"><div className="subsection-card__header"><h3>子章节</h3><span>{children.length}</span></div>{children.length === 0 ? <p className="empty-line">这里还没有子章节。</p> : <div className="content-list">{children.map((child) => <button key={child.id} onClick={() => selectChapter(child.id)}><span>›</span>{child.title}</button>)}</div>}</section><section className="subsection-card"><div className="subsection-card__header"><h3>知识点</h3><span>{placements.length}</span></div>{placements.length === 0 ? <p className="empty-line">这里还没有知识点。</p> : <div className="content-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span>•</span>{point.title}<em>{pointStatusLabel(point.status)}</em></button> : null; })}</div>}</section></div></>;
@@ -489,7 +667,9 @@ function App() {
     const hasChapterNote = documentHasText(chapterNoteDraft);
     return <div className="knowledge-point-page">
       <div className="content-heading"><div>{viewMode === "edit" ? <><p className="content-kicker">知识点 · 编辑</p><input className="point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /></> : <><p className="content-kicker">知识点 · 阅读</p><h2>{selectedKnowledgePoint.title}</h2></>}<p className="content-hint">当前 placement：{selectedChapter ? chapterPath(selectedChapter.id) : "当前目录"}</p></div><SaveBadge state={saveState} /></div>
-      <div className="action-row"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span>{viewMode === "read" ? <button className="primary-button" onClick={() => { setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}{organizeMode && <button className="quiet-button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button className="secondary-button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button className="quiet-button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button className="danger-button" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div>
+      <div className="action-row"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "取消收藏" : "收藏"}</button><button className="quiet-button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶"}</button>{viewMode === "read" ? <button className="primary-button" onClick={() => { setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}{organizeMode && <button className="quiet-button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button className="secondary-button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button className="quiet-button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button className="danger-button" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div>
+      <div className="tag-strip"><span className="tag-strip__label">标签</span>{(pointMeta?.tags ?? []).map((tag) => <span className="tag-chip" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length === 0 && <span className="empty-line">暂无标签</span>}{viewMode === "edit" && <button type="button" className="quiet-button tag-edit-button" onClick={() => setTagPickerOpen((value) => !value)}>{tagPickerOpen ? "收起标签" : "编辑标签"}</button>}</div>
+      {tagPickerOpen && viewMode === "edit" && <div className="tag-picker"><div className="tag-picker__options">{tags.map((tag) => <label className="tag-option" key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="reference-picker"><div className="reference-picker__header"><div><strong>选择目标章节</strong><span>只新增 placement，共享核心不复制。</span></div><button type="button" className="quiet-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><div className="reference-picker__tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
       <section className="placements-panel"><div className="placements-panel__heading"><h3>所在章节</h3><span>{pointPlacements.length} 处</span></div><div className="placement-links">{pointPlacements.map((placement) => <button type="button" className={placement.id === selectedPlacement?.id ? "placement-link placement-link--current" : "placement-link"} key={placement.id} onClick={() => selectKnowledgePoint(placement)}>{chapterPath(placement.chapter_id)}</button>)}</div></section>
       {organizeMode && selectedPlacement && <div className="move-panel"><label htmlFor="point-move">移动当前引用到章节</label><select id="point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
@@ -498,10 +678,11 @@ function App() {
     </div>;
   };
 
-  return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">ENGLISH HANDOUT WORKBENCH · PHASE 4</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">章节目录、共享核心与每个章节自己的补充，都在这里安静地保存。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
+  return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">ENGLISH HANDOUT WORKBENCH · PHASE 5</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">搜索、标签和最近编辑，让不断成长的讲义始终容易找到。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
+    <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
-    <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>我的讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : renderChapterContent()}</section></div>
-    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>第四阶段：知识点引用与本章补充</span></footer></section></main>;
+    <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>我的讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
+    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>第五阶段：搜索、标签与快速访问</span></footer></section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }
