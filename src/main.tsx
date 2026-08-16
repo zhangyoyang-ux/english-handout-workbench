@@ -1,276 +1,702 @@
-import { StrictMode, useEffect, useRef, useState } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
-type Stage1Note = {
+type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
+
+type Chapter = {
   id: string;
   title: string;
+  parent_id: string | null;
+  sort_order: number;
   content: string;
   created_at: string;
   updated_at: string;
+  deleted_at: string | null;
 };
 
-type SaveState = "loading" | "idle" | "dirty" | "saving" | "saved" | "error";
+type KnowledgePoint = {
+  id: string;
+  title: string;
+  status: "draft" | "needs_improvement" | "organized";
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+};
+
+type Placement = {
+  id: string;
+  knowledge_point_id: string;
+  chapter_id: string;
+  sort_order: number;
+  created_at: string;
+};
+
+type TreeData = {
+  chapters: Chapter[];
+  knowledge_points: KnowledgePoint[];
+  knowledge_point_placements: Placement[];
+};
+
+type ApiErrorPayload = {
+  code?: string;
+  message?: string;
+  child_count?: number;
+  knowledge_point_count?: number;
+};
 
 type ApiResponse = {
   ok: boolean;
-  note?: Stage1Note | null;
-  error?: { code?: string; message?: string };
+  error?: ApiErrorPayload;
 };
 
-const DRAFT_KEY = "english-handout-workbench:stage1:unsaved-draft";
+type Selection = {
+  chapterId?: string;
+  knowledgePointId?: string;
+};
+
+const EMPTY_TREE: TreeData = {
+  chapters: [],
+  knowledge_points: [],
+  knowledge_point_placements: [],
+};
+
 const AUTOSAVE_DELAY = 800;
+const EXPANDED_KEY = "english-handout-workbench:phase2:expanded";
 const NOTES_FUNCTION_URL = import.meta.env.VITE_NOTES_FUNCTION_URL ??
   "https://dtcrxkdjzrklrhtxosxn.supabase.co/functions/v1/notes";
 
-function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "网络连接异常，请稍后重试。";
+class ApiRequestError extends Error {
+  code?: string;
+  details?: ApiErrorPayload;
+
+  constructor(message: string, code?: string, details?: ApiErrorPayload) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.code = code;
+    this.details = details;
+  }
 }
 
-async function requestJson(url: string, options?: RequestInit): Promise<ApiResponse> {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  });
+function endpoint(resource: string, params: Record<string, string> = {}) {
+  const url = new URL(NOTES_FUNCTION_URL);
+  url.searchParams.set("resource", resource);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  return url.toString();
+}
 
-  let body: ApiResponse;
+async function requestJson<T extends ApiResponse>(url: string, init?: RequestInit): Promise<T> {
+  let response: Response;
   try {
-    body = (await response.json()) as ApiResponse;
+    response = await fetch(url, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...init?.headers },
+    });
+  } catch (error) {
+    throw new ApiRequestError(error instanceof Error ? error.message : "网络连接异常，请稍后重试。", "NETWORK_ERROR");
+  }
+
+  let body: T;
+  try {
+    body = await response.json() as T;
   } catch {
-    throw new Error(`服务器返回异常（${response.status}）。`);
+    throw new ApiRequestError(`服务器返回异常（${response.status}）。`, "INVALID_RESPONSE");
   }
 
   if (!response.ok || !body.ok) {
-    throw new Error(body.error?.message ?? `请求失败（${response.status}）。`);
+    throw new ApiRequestError(
+      body.error?.message ?? `请求失败（${response.status}）。`,
+      body.error?.code,
+      body.error,
+    );
   }
 
   return body;
 }
 
-function readLocalDraft() {
+function readExpandedIds() {
   try {
-    const rawDraft = window.localStorage.getItem(DRAFT_KEY);
-    if (!rawDraft) return null;
-
-    const draft = JSON.parse(rawDraft) as { title?: unknown; content?: unknown };
-    if (typeof draft.title !== "string" || typeof draft.content !== "string") {
-      return null;
-    }
-
-    return { title: draft.title, content: draft.content };
+    const raw = window.localStorage.getItem(EXPANDED_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set<string>(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : []);
   } catch {
-    return null;
+    return new Set<string>();
   }
 }
 
-function writeLocalDraft(title: string, content: string) {
-  try {
-    window.localStorage.setItem(
-      DRAFT_KEY,
-      JSON.stringify({ title, content, savedAt: new Date().toISOString() }),
-    );
-  } catch {
-    // LocalStorage is only a best-effort recovery layer.
-  }
-}
-
-function clearLocalDraft() {
-  try {
-    window.localStorage.removeItem(DRAFT_KEY);
-  } catch {
-    // LocalStorage is optional and must never block cloud saving.
-  }
-}
-
-function SaveBadge({ state }: { state: SaveState }) {
-  const labels: Record<SaveState, string> = {
-    loading: "读取中",
+function statusLabel(state: SaveState) {
+  return {
     idle: "等待编辑",
     dirty: "待保存",
     saving: "保存中",
     saved: "已保存",
     error: "保存失败",
-  };
+  }[state];
+}
 
+function sortByOrder<T extends { sort_order: number; created_at: string }>(items: T[]) {
+  return [...items].sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at));
+}
+
+function SaveBadge({ state }: { state: SaveState }) {
   return (
     <span className={`save-badge save-badge--${state}`} role="status" aria-live="polite">
       <span className="save-badge__dot" aria-hidden="true" />
-      {labels[state]}
+      {statusLabel(state)}
     </span>
   );
 }
 
 function App() {
-  const [title, setTitle] = useState("");
-  const [content, setContent] = useState("");
-  const [saveState, setSaveState] = useState<SaveState>("loading");
+  const [tree, setTree] = useState<TreeData>(EMPTY_TREE);
+  const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
+  const [selectedKnowledgePointId, setSelectedKnowledgePointId] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(readExpandedIds);
+  const [organizeMode, setOrganizeMode] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [message, setMessage] = useState("");
-  const [isReady, setIsReady] = useState(false);
-  const revisionRef = useRef(0);
-  const noteIdRef = useRef<string | undefined>(undefined);
-  const skipAutosaveRef = useRef(true);
+  const [draggedChapterId, setDraggedChapterId] = useState<string | null>(null);
+  const [draggedPlacementId, setDraggedPlacementId] = useState<string | null>(null);
+  const loadedChapterIdRef = useRef<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  const selectedChapter = tree.chapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
+  const selectedKnowledgePoint = tree.knowledge_points.find((point) => point.id === selectedKnowledgePointId) ?? null;
+  const selectedPlacement = tree.knowledge_point_placements.find((placement) =>
+    placement.knowledge_point_id === selectedKnowledgePointId && placement.chapter_id === selectedChapterId,
+  ) ?? null;
 
-    async function loadNote() {
-      try {
-        const result = await requestJson(NOTES_FUNCTION_URL);
-        if (cancelled) return;
+  const chapterMap = useMemo(() => new Map(tree.chapters.map((chapter) => [chapter.id, chapter])), [tree.chapters]);
+  const pointMap = useMemo(() => new Map(tree.knowledge_points.map((point) => [point.id, point])), [tree.knowledge_points]);
 
-        if (result.note) {
-          setTitle(result.note.title);
-          setContent(result.note.content);
-          noteIdRef.current = result.note.id;
-          clearLocalDraft();
-          setSaveState("saved");
-          setMessage("已从 Supabase 读取正式内容。");
-        } else {
-          const localDraft = readLocalDraft();
-          if (localDraft) {
-            setTitle(localDraft.title);
-            setContent(localDraft.content);
-            skipAutosaveRef.current = false;
-            setSaveState("dirty");
-            setMessage("云端暂时没有内容，已载入未上传的临时草稿。");
-          } else {
-            setSaveState("idle");
-            setMessage("还没有测试记录，输入内容后会自动创建。");
-          }
-        }
-      } catch (error) {
-        if (cancelled) return;
+  const loadTree = useCallback(async (selection?: Selection) => {
+    const result = await requestJson<TreeData & ApiResponse>(endpoint("tree"));
+    setTree({
+      chapters: result.chapters ?? [],
+      knowledge_points: result.knowledge_points ?? [],
+      knowledge_point_placements: result.knowledge_point_placements ?? [],
+    });
 
-        const localDraft = readLocalDraft();
-        if (localDraft) {
-          setTitle(localDraft.title);
-          setContent(localDraft.content);
-          setMessage(`云端读取失败，已保留本地临时草稿：${getErrorMessage(error)}`);
-        } else {
-          setMessage(`云端读取失败，当前仍可编辑：${getErrorMessage(error)}`);
-        }
-        setSaveState("error");
-      } finally {
-        if (!cancelled) setIsReady(true);
-      }
+    if (selection?.knowledgePointId) {
+      setSelectedKnowledgePointId(selection.knowledgePointId);
+      setSelectedChapterId(selection.chapterId ?? null);
+    } else if (selection?.chapterId) {
+      setSelectedKnowledgePointId(null);
+      setSelectedChapterId(selection.chapterId);
+    } else {
+      setSelectedChapterId((current) => current && result.chapters.some((chapter) => chapter.id === current)
+        ? current
+        : result.chapters.find((chapter) => chapter.parent_id === null)?.id ?? result.chapters[0]?.id ?? null);
     }
-
-    void loadNote();
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   useEffect(() => {
-    if (!isReady) return;
-    if (skipAutosaveRef.current) {
-      skipAutosaveRef.current = false;
+    let cancelled = false;
+    setLoading(true);
+    void loadTree().catch((error) => {
+      if (!cancelled) setMessage(error instanceof Error ? error.message : "目录读取失败。");
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadTree]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expandedIds]));
+    } catch {
+      // UI state persistence is optional.
+    }
+  }, [expandedIds]);
+
+  useEffect(() => {
+    if (!selectedChapterId) return;
+    const ancestors = new Set<string>();
+    let current = chapterMap.get(selectedChapterId);
+    while (current?.parent_id) {
+      ancestors.add(current.parent_id);
+      current = chapterMap.get(current.parent_id);
+    }
+    if (ancestors.size > 0) {
+      setExpandedIds((previous) => new Set([...previous, ...ancestors]));
+    }
+  }, [chapterMap, selectedChapterId]);
+
+  useEffect(() => {
+    if (!selectedChapter || selectedKnowledgePointId) return;
+    if (loadedChapterIdRef.current !== selectedChapter.id) {
+      loadedChapterIdRef.current = selectedChapter.id;
+      setSaveState("saved");
       return;
     }
 
-    writeLocalDraft(title, content);
-    setSaveState((current) => (current === "saving" ? current : "dirty"));
+    const draftKey = `english-handout-workbench:phase2:chapter:${selectedChapter.id}`;
+    try {
+      window.localStorage.setItem(draftKey, JSON.stringify({ content: selectedChapter.content, savedAt: new Date().toISOString() }));
+    } catch {
+      // The cloud remains the formal data source.
+    }
 
-    const revision = ++revisionRef.current;
     const timer = window.setTimeout(async () => {
       setSaveState("saving");
       setMessage("");
-
       try {
-        const result = await requestJson(NOTES_FUNCTION_URL, {
-          method: "PUT",
-          body: JSON.stringify({ id: noteIdRef.current, title, content }),
+        await requestJson(endpoint("chapter", { id: selectedChapter.id }), {
+          method: "PATCH",
+          body: JSON.stringify({ content: selectedChapter.content }),
         });
-
-        if (!result.note) return;
-
-        if (!noteIdRef.current) {
-          noteIdRef.current = result.note.id;
-        }
-
-        if (revision !== revisionRef.current) return;
-
         setSaveState("saved");
-        setMessage("内容已写入 Supabase PostgreSQL。");
-        clearLocalDraft();
+        setMessage("章节内容已保存到 Supabase PostgreSQL。");
+        try {
+          window.localStorage.removeItem(draftKey);
+        } catch {
+          // Best-effort draft cleanup.
+        }
       } catch (error) {
-        if (revision !== revisionRef.current) return;
-
-        writeLocalDraft(title, content);
         setSaveState("error");
-        setMessage(`保存失败，输入内容已保留在本机临时草稿：${getErrorMessage(error)}`);
+        setMessage(`保存失败，章节内容已保留在本机临时草稿：${error instanceof Error ? error.message : "网络连接异常。"}`);
       }
     }, AUTOSAVE_DELAY);
 
     return () => window.clearTimeout(timer);
-  }, [content, isReady, title]);
+  }, [selectedChapter, selectedKnowledgePointId]);
 
-  const updateTitle = (value: string) => {
-    setTitle(value);
+  const childrenOf = (parentId: string | null) => sortByOrder(tree.chapters.filter((chapter) => chapter.parent_id === parentId));
+  const placementsOf = (chapterId: string) => sortByOrder(
+    tree.knowledge_point_placements
+      .filter((placement) => placement.chapter_id === chapterId)
+      .map((placement) => ({ ...placement, created_at: placement.created_at })),
+  );
+
+  const selectChapter = (chapterId: string) => {
+    setSelectedChapterId(chapterId);
+    setSelectedKnowledgePointId(null);
   };
 
-  const updateContent = (value: string) => {
-    setContent(value);
+  const selectKnowledgePoint = (placement: Placement) => {
+    setSelectedChapterId(placement.chapter_id);
+    setSelectedKnowledgePointId(placement.knowledge_point_id);
+  };
+
+  const toggleExpanded = (chapterId: string) => {
+    setExpandedIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(chapterId)) next.delete(chapterId);
+      else next.add(chapterId);
+      return next;
+    });
+  };
+
+  const mutate = async (action: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await action();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "操作失败，请稍后重试。");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createChapter = (parentId: string | null) => {
+    const title = window.prompt(parentId ? "新建子章节名称" : "新建一级章节名称", "");
+    if (title === null || !title.trim()) return;
+    void mutate(async () => {
+      const result = await requestJson<{ ok: true; chapter: Chapter }>(endpoint("chapter"), {
+        method: "POST",
+        body: JSON.stringify({ title: title.trim(), parent_id: parentId }),
+      });
+      await loadTree({ chapterId: result.chapter.id });
+      if (parentId) setExpandedIds((previous) => new Set([...previous, parentId]));
+      setMessage("章节已创建。");
+    });
+  };
+
+  const createKnowledgePoint = (chapterId: string) => {
+    const title = window.prompt("新建知识点名称", "");
+    if (title === null || !title.trim()) return;
+    void mutate(async () => {
+      const result = await requestJson<{ ok: true; point: KnowledgePoint; placement: Placement }>(endpoint("knowledge_point"), {
+        method: "POST",
+        body: JSON.stringify({ title: title.trim(), chapter_id: chapterId }),
+      });
+      await loadTree({ chapterId, knowledgePointId: result.point.id });
+      setExpandedIds((previous) => new Set([...previous, chapterId]));
+      setMessage("知识点已创建，默认状态为草稿。");
+    });
+  };
+
+  const renameChapter = (chapter: Chapter) => {
+    const title = window.prompt("重命名章节", chapter.title);
+    if (title === null || !title.trim() || title.trim() === chapter.title) return;
+    void mutate(async () => {
+      await requestJson(endpoint("chapter", { id: chapter.id }), {
+        method: "PATCH",
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      await loadTree({ chapterId: chapter.id });
+      setMessage("章节名称已更新。");
+    });
+  };
+
+  const deleteChapter = (chapter: Chapter) => {
+    void mutate(async () => {
+      try {
+        await requestJson(endpoint("chapter", { id: chapter.id }), { method: "DELETE" });
+        await loadTree();
+        setMessage("章节已移入软删除状态。");
+      } catch (error) {
+        if (!(error instanceof ApiRequestError) || error.code !== "CHAPTER_NOT_EMPTY") throw error;
+        const confirmed = window.confirm(`${error.message}\n\n确认软删除这个章节及其子章节吗？`);
+        if (!confirmed) return;
+        await requestJson(endpoint("chapter", { id: chapter.id, confirm: "true" }), { method: "DELETE" });
+        await loadTree();
+        setMessage("章节树已移入软删除状态。");
+      }
+    });
+  };
+
+  const renameKnowledgePoint = (point: KnowledgePoint) => {
+    const title = window.prompt("重命名知识点", point.title);
+    if (title === null || !title.trim() || title.trim() === point.title) return;
+    void mutate(async () => {
+      await requestJson(endpoint("knowledge_point", { id: point.id }), {
+        method: "PATCH",
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      await loadTree({ chapterId: selectedChapterId ?? undefined, knowledgePointId: point.id });
+      setMessage("知识点名称已更新。");
+    });
+  };
+
+  const deleteKnowledgePoint = (point: KnowledgePoint) => {
+    if (!window.confirm(`确定软删除“${point.title}”吗？`)) return;
+    void mutate(async () => {
+      await requestJson(endpoint("knowledge_point", { id: point.id }), { method: "DELETE" });
+      await loadTree({ chapterId: selectedChapterId ?? undefined });
+      setMessage("知识点已移入软删除状态。");
+    });
+  };
+
+  const moveChapter = (chapterId: string, parentValue: string) => {
+    const parentId = parentValue || null;
+    void mutate(async () => {
+      await requestJson(endpoint("chapter", { id: chapterId }), {
+        method: "PATCH",
+        body: JSON.stringify({ operation: "move", parent_id: parentId }),
+      });
+      await loadTree({ chapterId });
+      setMessage("章节位置已更新。");
+    });
+  };
+
+  const moveKnowledgePoint = (placementId: string, chapterId: string) => {
+    void mutate(async () => {
+      await requestJson(endpoint("placement", { id: placementId }), {
+        method: "PATCH",
+        body: JSON.stringify({ chapter_id: chapterId }),
+      });
+      await loadTree({ chapterId, knowledgePointId: selectedKnowledgePointId ?? undefined });
+      setExpandedIds((previous) => new Set([...previous, chapterId]));
+      setMessage("知识点位置已更新。");
+    });
+  };
+
+  const reorderSiblings = (sourceId: string, targetId: string, parentId: string | null) => {
+    const siblings = childrenOf(parentId).map((chapter) => chapter.id);
+    const sourceIndex = siblings.indexOf(sourceId);
+    const targetIndex = siblings.indexOf(targetId);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
+    siblings.splice(sourceIndex, 1);
+    siblings.splice(targetIndex, 0, sourceId);
+    void mutate(async () => {
+      await requestJson(endpoint("chapters"), {
+        method: "PATCH",
+        body: JSON.stringify({ parent_id: parentId, ids: siblings }),
+      });
+      await loadTree({ chapterId: selectedChapterId ?? undefined });
+      setMessage("章节顺序已保存。");
+    });
+  };
+
+  const reorderKnowledgePoints = (sourceId: string, targetId: string, chapterId: string) => {
+    const ids = placementsOf(chapterId).map((placement) => placement.id);
+    const sourceIndex = ids.indexOf(sourceId);
+    const targetIndex = ids.indexOf(targetId);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
+    ids.splice(sourceIndex, 1);
+    ids.splice(targetIndex, 0, sourceId);
+    void mutate(async () => {
+      await requestJson(endpoint("knowledge_points"), {
+        method: "PATCH",
+        body: JSON.stringify({ chapter_id: chapterId, ids }),
+      });
+      await loadTree({ chapterId, knowledgePointId: selectedKnowledgePointId ?? undefined });
+      setMessage("知识点顺序已保存。");
+    });
+  };
+
+  const shiftChapter = (chapter: Chapter, direction: -1 | 1) => {
+    const siblings = childrenOf(chapter.parent_id);
+    const index = siblings.findIndex((item) => item.id === chapter.id);
+    const target = siblings[index + direction];
+    if (target) reorderSiblings(chapter.id, target.id, chapter.parent_id);
+  };
+
+  const shiftKnowledgePoint = (placement: Placement, direction: -1 | 1) => {
+    const siblings = placementsOf(placement.chapter_id);
+    const index = siblings.findIndex((item) => item.id === placement.id);
+    const target = siblings[index + direction];
+    if (target) reorderKnowledgePoints(placement.id, target.id, placement.chapter_id);
+  };
+
+  const chapterCanMoveTo = (chapter: Chapter, targetId: string | null) => {
+    if (targetId === null) return true;
+    if (targetId === chapter.id) return false;
+    let current = chapterMap.get(targetId);
+    while (current) {
+      if (current.id === chapter.id) return false;
+      current = current.parent_id ? chapterMap.get(current.parent_id) : undefined;
+    }
+    return true;
+  };
+
+  const possibleParents = (chapter: Chapter) => tree.chapters
+    .filter((item) => item.id !== chapter.id && chapterCanMoveTo(chapter, item.id))
+    .sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
+
+  const handleChapterDrop = (event: DragEvent<HTMLDivElement>, target: Chapter) => {
+    event.preventDefault();
+    const sourceId = event.dataTransfer.getData("chapter-id") || draggedChapterId;
+    setDraggedChapterId(null);
+    if (!organizeMode || !sourceId) return;
+    const source = chapterMap.get(sourceId);
+    if (source && source.parent_id === target.parent_id) reorderSiblings(source.id, target.id, target.parent_id);
+  };
+
+  const handlePointDrop = (event: DragEvent<HTMLDivElement>, target: Placement) => {
+    event.preventDefault();
+    const sourceId = event.dataTransfer.getData("placement-id") || draggedPlacementId;
+    setDraggedPlacementId(null);
+    if (!organizeMode || !sourceId) return;
+    const source = tree.knowledge_point_placements.find((item) => item.id === sourceId);
+    if (source && source.chapter_id === target.chapter_id) reorderKnowledgePoints(source.id, target.id, target.chapter_id);
+  };
+
+  const renderPoint = (placement: Placement) => {
+    const point = pointMap.get(placement.knowledge_point_id);
+    if (!point) return null;
+    return (
+      <div
+        className={`tree-point ${selectedKnowledgePointId === point.id ? "tree-point--selected" : ""}`}
+        key={placement.id}
+        draggable={organizeMode}
+        onDragStart={(event) => {
+          setDraggedPlacementId(placement.id);
+          event.dataTransfer.setData("placement-id", placement.id);
+        }}
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => handlePointDrop(event, placement)}
+      >
+        <button className="tree-point__button" onClick={() => selectKnowledgePoint(placement)}>
+          <span className="tree-point__bullet" aria-hidden="true" />
+          <span className="tree-point__title">{point.title}</span>
+          <span className="status-pill">草稿</span>
+        </button>
+        {organizeMode && (
+          <span className="sort-buttons">
+            <button aria-label="知识点上移" onClick={() => shiftKnowledgePoint(placement, -1)}>↑</button>
+            <button aria-label="知识点下移" onClick={() => shiftKnowledgePoint(placement, 1)}>↓</button>
+          </span>
+        )}
+      </div>
+    );
+  };
+
+  const renderChapter = (chapter: Chapter, depth = 0): ReactNode => {
+    const children = childrenOf(chapter.id);
+    const placements = placementsOf(chapter.id);
+    const expanded = expandedIds.has(chapter.id);
+    const hasChildren = children.length > 0 || placements.length > 0;
+    return (
+      <div className="tree-branch" key={chapter.id}>
+        <div
+          className={`tree-row ${selectedChapterId === chapter.id && !selectedKnowledgePointId ? "tree-row--selected" : ""}`}
+          style={{ "--tree-depth": depth } as CSSProperties}
+          draggable={organizeMode}
+          onDragStart={(event) => {
+            setDraggedChapterId(chapter.id);
+            event.dataTransfer.setData("chapter-id", chapter.id);
+          }}
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => handleChapterDrop(event, chapter)}
+        >
+          <button
+            className={`tree-toggle ${hasChildren ? "" : "tree-toggle--empty"}`}
+            aria-label={expanded ? "折叠章节" : "展开章节"}
+            onClick={() => hasChildren && toggleExpanded(chapter.id)}
+          >
+            {hasChildren ? (expanded ? "⌄" : ">") : "·"}
+          </button>
+          <button className="tree-row__button" onClick={() => selectChapter(chapter.id)}>
+            <span className="tree-row__title">{chapter.title}</span>
+            {(children.length > 0 || placements.length > 0) && <span className="tree-count">{children.length + placements.length}</span>}
+          </button>
+          {organizeMode && (
+            <span className="sort-buttons">
+              <button aria-label="章节上移" onClick={() => shiftChapter(chapter, -1)}>↑</button>
+              <button aria-label="章节下移" onClick={() => shiftChapter(chapter, 1)}>↓</button>
+            </span>
+          )}
+        </div>
+        {expanded && (
+          <div className="tree-children">
+            {children.map((child) => renderChapter(child, depth + 1))}
+            {placements.map(renderPoint)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const updateChapterContent = (content: string) => {
+    if (!selectedChapterId) return;
+    setTree((previous) => ({
+      ...previous,
+      chapters: previous.chapters.map((chapter) => chapter.id === selectedChapterId ? { ...chapter, content } : chapter),
+    }));
+    setSaveState("dirty");
+  };
+
+  const renderChapterContent = () => {
+    if (!selectedChapter) return <EmptyState onCreateRoot={() => createChapter(null)} />;
+    const children = childrenOf(selectedChapter.id);
+    const placements = placementsOf(selectedChapter.id);
+    return (
+      <>
+        <div className="content-heading">
+          <div>
+            <p className="content-kicker">章节</p>
+            <h2>{selectedChapter.title}</h2>
+            <p className="content-hint">章节可以拥有自己的总览内容，也可以继续包含任意层级的子章节。</p>
+          </div>
+          <SaveBadge state={saveState} />
+        </div>
+
+        <div className="action-row">
+          <button className="primary-button" disabled={busy} onClick={() => createChapter(selectedChapter.id)}>＋ 新建子章节</button>
+          <button className="secondary-button" disabled={busy} onClick={() => createKnowledgePoint(selectedChapter.id)}>＋ 新建知识点</button>
+          {organizeMode && <>
+            <button className="quiet-button" disabled={busy} onClick={() => renameChapter(selectedChapter)}>重命名</button>
+            <button className="danger-button" disabled={busy} onClick={() => deleteChapter(selectedChapter)}>删除</button>
+          </>}
+        </div>
+
+        {organizeMode && (
+          <div className="move-panel">
+            <label htmlFor="chapter-move">移动章节到</label>
+            <select
+              id="chapter-move"
+              value={selectedChapter.parent_id ?? ""}
+              disabled={busy}
+              onChange={(event) => moveChapter(selectedChapter.id, event.target.value)}
+            >
+              <option value="">一级目录</option>
+              {possibleParents(selectedChapter).map((parent) => <option key={parent.id} value={parent.id}>{parent.title}</option>)}
+            </select>
+          </div>
+        )}
+
+        <label className="section-label" htmlFor="chapter-content">章节内容</label>
+        <textarea
+          id="chapter-content"
+          className="chapter-content-input"
+          value={selectedChapter.content}
+          onChange={(event) => updateChapterContent(event.target.value)}
+          placeholder="在这里写下本章节的总览、学习顺序或注意事项……"
+        />
+
+        <div className="subsection-grid">
+          <section className="subsection-card">
+            <div className="subsection-card__header"><h3>子章节</h3><span>{children.length}</span></div>
+            {children.length === 0 ? <p className="empty-line">这里还没有子章节。</p> : <div className="content-list">{children.map((child) => <button key={child.id} onClick={() => selectChapter(child.id)}><span>›</span>{child.title}</button>)}</div>}
+          </section>
+          <section className="subsection-card">
+            <div className="subsection-card__header"><h3>知识点</h3><span>{placements.length}</span></div>
+            {placements.length === 0 ? <p className="empty-line">这里还没有知识点。</p> : <div className="content-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span>•</span>{point.title}<em>草稿</em></button> : null; })}</div>}
+          </section>
+        </div>
+      </>
+    );
+  };
+
+  const renderKnowledgePointContent = () => {
+    if (!selectedKnowledgePoint) return <EmptyState onCreateRoot={() => createChapter(null)} />;
+    return (
+      <>
+        <div className="content-heading">
+          <div>
+            <p className="content-kicker">知识点</p>
+            <h2>{selectedKnowledgePoint.title}</h2>
+            <p className="content-hint">当前知识点位于：{selectedChapter?.title ?? "当前目录"}</p>
+          </div>
+          <span className="large-status-pill">草稿</span>
+        </div>
+        <div className="action-row">
+          {organizeMode && <button className="quiet-button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}
+          <button className="danger-button" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除</button>
+        </div>
+        {organizeMode && selectedPlacement && (
+          <div className="move-panel">
+            <label htmlFor="point-move">移动到章节</label>
+            <select id="point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>
+              {tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
+            </select>
+          </div>
+        )}
+        <div className="future-editor-note">
+          <span className="future-editor-note__icon">✦</span>
+          <div><strong>知识点已建立</strong><p>正式讲义编辑将在第三阶段开放。本阶段先完成目录、归属和排序。</p></div>
+        </div>
+      </>
+    );
   };
 
   return (
     <main className="app-shell">
       <section className="workbench-card" aria-labelledby="page-title">
         <header className="page-header">
-          <div>
-            <p className="eyebrow">ENGLISH HANDOUT WORKBENCH · PHASE 1</p>
-            <h1 id="page-title">个人英语讲义工作台</h1>
-            <p className="subtitle">先把最重要的一件事做稳：文字保存到云端，随时都能继续。</p>
-          </div>
-          <SaveBadge state={saveState} />
+          <div><p className="eyebrow">ENGLISH HANDOUT WORKBENCH · PHASE 2</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">先把英语讲义的骨架搭好：章节、层级和知识点都保存在云端。</p></div>
+          <div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div>
         </header>
 
-        <div className="test-strip">
-          <span className="test-strip__icon" aria-hidden="true">✦</span>
-          <div>
-            <strong>第一阶段数据保存测试</strong>
-            <span>标题和正文会在停止输入约 0.8 秒后自动保存。</span>
-          </div>
+        {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
+
+        <div className="workbench-layout">
+          <aside className="tree-sidebar" aria-label="章节目录">
+            <div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>我的讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>
+            {organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}
+            <div className="tree-list">
+              {loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}
+            </div>
+          </aside>
+
+          <section className="content-panel" aria-live="polite">
+            {loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : renderChapterContent()}
+          </section>
         </div>
-
-        <form className="note-form" onSubmit={(event) => event.preventDefault()}>
-          <label className="field-label" htmlFor="note-title">标题</label>
-          <input
-            id="note-title"
-            className="title-input"
-            type="text"
-            value={title}
-            onChange={(event) => updateTitle(event.target.value)}
-            placeholder="例如：一般现在时测试"
-            maxLength={200}
-            autoComplete="off"
-          />
-
-          <label className="field-label field-label--content" htmlFor="note-content">正文</label>
-          <textarea
-            id="note-content"
-            className="content-input"
-            value={content}
-            onChange={(event) => updateContent(event.target.value)}
-            placeholder="在这里输入一段讲义内容……"
-            spellCheck="false"
-          />
-        </form>
-
-        <footer className="page-footer">
-          <div className="connection-note">
-            <span className="connection-note__mark" aria-hidden="true" />
-            <span>{message || "正式数据源：Supabase PostgreSQL"}</span>
-          </div>
-          <span className="phase-note">当前只验证文字保存链路</span>
-        </footer>
+        <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>第二阶段：章节与知识点骨架</span></footer>
       </section>
     </main>
   );
 }
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) {
+  return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>;
+}
+
+createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

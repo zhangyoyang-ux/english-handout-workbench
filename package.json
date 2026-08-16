@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "lint": "eslint .",
-    "test": "node tests/phase1-smoke.mjs"
+    "test": "node tests/phase1-smoke.mjs && node tests/phase2-smoke.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.54.0",
