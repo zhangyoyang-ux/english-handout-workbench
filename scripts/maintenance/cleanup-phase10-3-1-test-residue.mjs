@@ -274,7 +274,10 @@ function executeSql(sql) {
   const filePath = path.join(os.tmpdir(), `english-handout-workbench-cleanup-${process.pid}-${Date.now()}.sql`);
   fs.writeFileSync(filePath, `${sql}\n`, "utf8");
   try {
-    return execFileSync("npx", ["--yes", "supabase@latest", "db", "query", "--linked", "--file", filePath], { cwd: REPO_ROOT, encoding: "utf8", shell: process.platform === "win32", stdio: ["ignore", "pipe", "pipe"] });
+    return execFileSync("npx", ["--yes", "supabase@latest", "db", "query", "--linked", "--debug", "--file", filePath], { cwd: REPO_ROOT, encoding: "utf8", shell: process.platform === "win32", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    const details = [error?.stdout, error?.stderr].filter(Boolean).map((value) => String(value).trim()).filter(Boolean).join("\n");
+    throw new Error(details ? `${error.message}\n${details}` : error.message);
   } finally {
     fs.rmSync(filePath, { force: true });
   }
