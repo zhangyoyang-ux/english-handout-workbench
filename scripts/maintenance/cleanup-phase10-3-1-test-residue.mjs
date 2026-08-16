@@ -61,7 +61,7 @@ const CONTENT_IDS = [
 ];
 
 const PLACEMENT_IDS = [
-  "02b4411e-db3d-47be-8987-b50ff03f1a5c", "07060bfb-a342-4dcc-a48a-b2576bce9a71",
+  "02b4411e-db3d-47be-8987-b50ff03f1a5c", "07060bfb-a342-4dcc-a48a-b2576bce9a71", "0c02ee0d-5c25-45ef-97ff-b7811252fa24",
   "186c919a-be13-4145-a751-cc2bb0bd7f5f", "1fd19486-a5cc-4e80-aa6e-1024ab3f8d41",
   "228c7bbe-9b1d-4b17-b7fb-8d642450946d", "24ca3a72-a020-4842-bd5d-ea8daffa1f5c",
   "266d2534-caaf-4318-b6b0-f3a8c0793fbb", "3f65e3f0-c91f-4d7f-93bf-377e9438be20",
@@ -83,7 +83,7 @@ const PLACEMENT_IDS = [
   "dfee4b34-33ec-4d43-bf64-b172e8225dee", "e22314fb-fe44-4af7-817b-bc544be27045",
   "e38886c7-1f7b-4b6c-b3b4-04017c2d6995", "e7795ea0-0897-4ded-9416-f887b6178df6",
   "f20cfb1b-849f-4140-a538-00bdeaddc06d", "f9862299-5b13-47eb-8f73-087fd3cb40b3",
-  "ffed2061-7a65-4d40-85ac-099589351067",
+  "ffed2061-7a65-4d40-85ac-099589351067", "84b67261-41bc-4ffe-b694-b83988bfb6e6",
 ];
 
 const KNOWLEDGE_POINT_VERSION_IDS = [
