@@ -268,12 +268,12 @@ function App() {
       setContentRecord(null); setContentDraft(emptyContentDraft()); setContentDirty(false); setTitleDraft(""); pendingContentFieldsRef.current.clear(); return;
     }
     const requestId = ++contentRequestRef.current;
-    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(selectedKnowledgePoint?.title ?? ""); setSaveState("saved"); setMessage("");
+    contentVersionRef.current += 1; pendingContentFieldsRef.current.clear(); setViewMode("read"); setContentLoading(true); setContentDirty(false); setContentRecord(null); setContentDraft(emptyContentDraft()); setTitleDraft(""); setSaveState("saved"); setMessage("");
     void requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }))
       .then((result) => { if (requestId !== contentRequestRef.current) return; setContentRecord(result.content); setContentDraft(contentDraftFromRecord(result.content)); setTitleDraft(result.knowledge_point.title); })
       .catch((error) => { if (requestId !== contentRequestRef.current) return; setSaveState("error"); setMessage(`知识点内容读取失败：${error instanceof Error ? error.message : "网络连接异常。"}`); })
       .finally(() => { if (requestId === contentRequestRef.current) setContentLoading(false); });
-  }, [selectedKnowledgePointId, selectedKnowledgePoint?.title]);
+  }, [selectedKnowledgePointId]);
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
