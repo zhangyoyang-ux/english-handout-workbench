@@ -1,17 +1,18 @@
 # 悠扬讲义 Stable Baseline
 
-> 这是 10.4 工程封版候选基线记录。真实设备的断网阅读与恢复网络测试仍需由用户本人完成；在该门槛通过前，不宣称正式 Stable 封版。
+> 这是悠扬讲义 V1.0 的正式 Stable 基线记录。
 
 ## 产品
 
 - 产品：悠扬讲义
 - 工程基线日期：2026-08-16
-- 目标稳定版本：v1.0.0
-- 当前状态：Engineering Candidate / Maintenance Gate Pending
+- 稳定版本：v1.0.0
+- 当前状态：Stable / Maintenance Mode
 
 ## 代码与部署
 
-- Final engineering commit：`1abe992bd6220c7bf730d49c4c779d0e5b725761`
+- Final engineering commit：`8bbec0909c2e3b6fa9c5356c7c588f71804a8efe`
+- Stable tag：`v1.0.0`（annotated，已推送）
 - GitHub repository：`zhangyoyang-ux/english-handout-workbench`
 - Production URL：`https://zhangyoyang-ux.github.io/english-handout-workbench/`
 - Supabase Edge Function：`https://dtcrxkdjzrklrhtxosxn.supabase.co/functions/v1/notes`
@@ -46,13 +47,11 @@
 - Build：PASS
 - Lint：PASS
 
-## Release gate
+## 真实设备验收（用户确认）
 
-正式建立 `v1.0.0` tag 并宣布“悠扬讲义 V1.0 正式封版”前，必须由用户本人确认：
+- 电脑真实断网阅读：PASS
+- 手机真实断网阅读：PASS
+- Wi-Fi / 移动网络恢复：PASS
+- 离线阅读未产生云端写入：PASS
 
-- 电脑真实断网后仍可打开并阅读
-- 手机真实断网后仍可打开、进入目录并阅读
-- Wi-Fi / 移动网络恢复后回到在线状态
-- 离线阅读不会产生任何云端写入
-
-通过上述真实设备验收后，再创建并推送正式 `v1.0.0` annotated tag，进入 Stable / Maintenance Mode。
+真实设备验收完成，产品进入 Stable / Maintenance Mode。
