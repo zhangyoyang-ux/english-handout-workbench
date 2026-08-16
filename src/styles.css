@@ -211,7 +211,7 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
 .tag-create input { min-width: 0; flex: 1; padding: 8px 9px; border: 1px solid #dededb; border-radius: 8px; outline: none; background: #fff; color: #303035; font-size: 12px; }
 
 @media (max-width: 620px) {
-  .search-row { display: grid; grid-template-columns: 1fr 1fr; }
+  .search-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .search-box { grid-column: 1 / -1; }
   .access-item { grid-template-columns: auto minmax(0, 1fr); }
   .access-item__path { grid-column: 2; max-width: 100%; }
@@ -447,7 +447,7 @@ h1 { font-size: clamp(28px, 3.1vw, 40px); letter-spacing: -.045em; }
 @media (max-width: 500px) {
   .page-header { display: block; }
   .header-actions { margin-top: 16px; }
-  .search-row { grid-template-columns: 1fr 1fr; }
+  .search-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .content-heading { display: block; }
   .content-heading__tools { margin-top: 12px; }
   .content-heading > .save-badge { margin-top: 0; }
