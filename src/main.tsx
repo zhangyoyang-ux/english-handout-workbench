@@ -268,6 +268,9 @@ function App() {
   const [fastAccessLoading, setFastAccessLoading] = useState(false);
   const [chapterEditMode, setChapterEditMode] = useState(false);
   const [showFavorites, setShowFavorites] = useState(false);
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia("(max-width: 900px)").matches);
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
+  const [mobileSheet, setMobileSheet] = useState<"menu" | "new" | "chapter" | "point" | "placements" | "filters" | null>(null);
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const contentVersionRef = useRef(0);
@@ -349,6 +352,14 @@ function App() {
     if (ancestors.size > 0) setExpandedIds((previous) => new Set([...previous, ...ancestors]));
   }, [chapterMap, selectedChapterId]);
   useEffect(() => { setChapterEditMode(false); }, [selectedChapterId]);
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(max-width: 900px)");
+    const updateViewport = () => setIsMobile(mediaQuery.matches);
+    updateViewport();
+    mediaQuery.addEventListener?.("change", updateViewport);
+    return () => mediaQuery.removeEventListener?.("change", updateViewport);
+  }, []);
+  useEffect(() => { setMobileSheet(null); }, [selectedChapterId, selectedKnowledgePointId]);
 
   useEffect(() => {
     if (!selectedChapter || selectedKnowledgePointId) return;
@@ -451,6 +462,8 @@ function App() {
   const selectKnowledgePoint = (placement: Placement) => { setSelectedChapterId(placement.chapter_id); setSelectedKnowledgePointId(placement.knowledge_point_id); setViewMode("read"); };
   const openAccessItem = (item: Pick<AccessItem, "item_type" | "item_id" | "chapter_id" | "placement_id">) => {
     setSearchQuery("");
+    setMobileSearchOpen(false);
+    setMobileSheet(null);
     if (item.item_type === "chapter") {
       selectChapter(item.item_id);
       return;
@@ -684,6 +697,105 @@ function App() {
     </div>;
   };
 
+  const mobileGoHome = () => {
+    setSelectedChapterId(null);
+    setSelectedKnowledgePointId(null);
+    setOrganizeMode(false);
+    setMobileSearchOpen(false);
+    setMobileSheet(null);
+  };
+  const renderMobileAccessRow = (item: AccessItem, label?: string) => <button type="button" className="mobile-access-row" key={`${item.item_type}-${item.item_id}-${item.placement_id ?? ""}`} onClick={() => openAccessItem(item)}>
+    <span className="mobile-access-row__main"><strong>{item.title}</strong><span>{item.path || label || (item.item_type === "chapter" ? "章节" : "知识点")}</span></span>
+    <span className="mobile-access-row__meta">{item.status ? pointStatusLabel(item.status) : label ?? "›"}<span aria-hidden="true">›</span></span>
+  </button>;
+  const renderMobileMessage = () => message && <div className={`mobile-message ${saveState === "error" ? "mobile-message--error" : ""}`} role="status">{message}</div>;
+
+  const renderMobileHome = () => {
+    const continueItem = fastAccess.recent[0];
+    const rootChapters = childrenOf(null);
+    return <div className="mobile-page mobile-home-page">
+      <header className="mobile-header mobile-header--home">
+        <h1 id="mobile-page-title">我的讲义</h1>
+        <div className="mobile-header__actions"><button type="button" className="mobile-icon-button" aria-label="搜索讲义" onClick={() => setMobileSearchOpen(true)}>⌕</button><button type="button" className="mobile-icon-button" aria-label="更多操作" onClick={() => setMobileSheet("menu")}>···</button></div>
+      </header>
+      {renderMobileMessage()}
+      {loading ? <p className="mobile-loading">正在读取目录……</p> : <div className="mobile-home-content">
+        {fastAccessLoading && <p className="mobile-loading">正在读取快速访问……</p>}
+        {continueItem && <section className="mobile-home-section mobile-home-section--continue"><div className="mobile-section-heading"><div><h2>继续整理</h2><span>最近一次编辑</span></div></div>{renderMobileAccessRow(continueItem, "继续")}</section>}
+        <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>置顶</h2><span>最多 4 个</span></div></div>{fastAccess.pins.length === 0 ? <p className="mobile-empty">还没有置顶项目。</p> : <div className="mobile-pin-list">{fastAccess.pins.slice(0, 4).map((item) => renderMobileAccessRow(item, "置顶"))}</div>}</section>
+        <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>章节</h2><span>{rootChapters.length} 个一级章节</span></div></div>{rootChapters.length === 0 ? <p className="mobile-empty">还没有章节，从这里开始整理你的知识体系。</p> : <div className="mobile-chapter-list">{rootChapters.map((chapter) => <button type="button" className="mobile-list-row" key={chapter.id} onClick={() => selectChapter(chapter.id)}><span>{chapter.title}</span><span aria-hidden="true">›</span></button>)}</div>}</section>
+        <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>最近编辑</h2><span>最多 6 条</span></div></div>{fastAccess.recent.length === 0 ? <p className="mobile-empty">还没有最近编辑记录。</p> : <div className="mobile-access-list">{fastAccess.recent.slice(0, 6).map((item) => renderMobileAccessRow(item))}</div>}</section>
+        <section className="mobile-home-section mobile-home-section--favorites"><button type="button" className="mobile-light-link" onClick={() => setShowFavorites((value) => !value)}>收藏 <span>（{fastAccess.favorites.length}）</span><b aria-hidden="true">›</b></button>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="mobile-empty">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="mobile-access-list">{fastAccess.favorites.map((item) => renderMobileAccessRow(item, "收藏"))}</div>)}</section>
+      </div>}
+    </div>;
+  };
+
+  const renderMobileOrganize = () => <div className="mobile-page mobile-organize-page">
+    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => setOrganizeMode(false)}>‹ 我的讲义</button><h1>整理目录</h1><button type="button" className="mobile-text-button" onClick={() => setOrganizeMode(false)}>完成</button></header>
+    {renderMobileMessage()}
+    <p className="mobile-page-intro">在这里调整章节层级与顺序。完成后返回正常阅读。</p>
+    <div className="mobile-organize-tree">{loading ? <p className="mobile-loading">正在读取目录……</p> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div>
+  </div>;
+
+  const renderMobileChapter = () => {
+    if (!selectedChapter) return renderMobileHome();
+    const children = childrenOf(selectedChapter.id);
+    const placements = placementsOf(selectedChapter.id);
+    const hasOverview = Boolean(selectedChapter.content.trim());
+    return <div className="mobile-page mobile-chapter-page">
+      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={mobileGoHome}>‹ 我的讲义</button><h1>{selectedChapter.title}</h1><div className="mobile-header__actions"><button type="button" className="mobile-icon-button" aria-label="新建" onClick={() => setMobileSheet("new")}>＋</button><button type="button" className="mobile-icon-button" aria-label="章节更多操作" onClick={() => setMobileSheet("chapter")}>···</button></div></header>
+      {renderMobileMessage()}
+      {selectedChapter.parent_id && <p className="mobile-path">{chapterPath(selectedChapter.id)}</p>}
+      <section className="mobile-chapter-overview"><div className="mobile-section-heading"><div><h2>章节总览</h2><span>{hasOverview ? "" : "还没有章节说明"}</span></div>{hasOverview && !chapterEditMode && <button type="button" className="mobile-inline-link" onClick={() => setChapterEditMode(true)}>编辑</button>}</div>{chapterEditMode ? <><textarea className="mobile-textarea" value={selectedChapter.content} onChange={(event) => updateChapterContent(event.target.value)} placeholder="写下本章节的总览、学习顺序或注意事项……" /><div className="mobile-edit-actions"><SaveBadge state={saveState} /><button type="button" className="mobile-text-button" onClick={() => setChapterEditMode(false)}>完成</button></div></> : hasOverview ? <p className="mobile-overview-text">{selectedChapter.content}</p> : <button type="button" className="mobile-add-note" onClick={() => setChapterEditMode(true)}>＋ 添加章节说明</button>}</section>
+      <section className="mobile-chapter-section"><div className="mobile-section-heading"><div><h2>子章节</h2><span>{children.length} 个</span></div></div>{children.length === 0 ? <p className="mobile-empty">暂无子章节</p> : <div className="mobile-chapter-list">{children.map((child) => <button type="button" className="mobile-list-row" key={child.id} onClick={() => selectChapter(child.id)}><span>{child.title}</span><span aria-hidden="true">›</span></button>)}</div>}</section>
+      <section className="mobile-chapter-section"><div className="mobile-section-heading"><div><h2>知识点</h2><span>{placements.length} 个</span></div></div>{placements.length === 0 ? <p className="mobile-empty">暂无知识点</p> : <div className="mobile-point-list">{placements.map((placement) => { const point = pointMap.get(placement.knowledge_point_id); return point ? <button type="button" className="mobile-list-row mobile-list-row--point" key={placement.id} onClick={() => selectKnowledgePoint(placement)}><span><strong>{point.title}</strong><small>{pointStatusLabel(point.status)}</small></span><span aria-hidden="true">›</span></button> : null; })}</div>}</section>
+    </div>;
+  };
+
+  const renderMobileKnowledgePoint = () => {
+    if (!selectedKnowledgePoint) return renderMobileHome();
+    const placements = selectedChapterId ? placementsOf(selectedChapterId) : [];
+    const pointPlacements = sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === selectedKnowledgePoint.id));
+    const currentIndex = placements.findIndex((placement) => placement.knowledge_point_id === selectedKnowledgePoint.id);
+    const hasReadableContent = CONTENT_SECTIONS.some((section) => documentHasText(contentDraft[section]));
+    const hasChapterNote = documentHasText(chapterNoteDraft);
+    return <div className="mobile-page mobile-knowledge-point">
+      <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={() => selectedChapterId ? selectChapter(selectedChapterId) : mobileGoHome()}>‹ {selectedChapter?.title ?? "我的讲义"}</button><div className="mobile-header__actions"><SaveBadge state={saveState} /><button type="button" className="mobile-icon-button" aria-label="知识点更多操作" onClick={() => setMobileSheet("point")}>···</button></div></header>
+      {renderMobileMessage()}
+      <div className="mobile-point-heading">{viewMode === "edit" ? <input className="mobile-point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /> : <h1>{selectedKnowledgePoint.title}</h1>}<div className="mobile-point-meta"><span className="mobile-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span>{(pointMeta?.tags ?? []).slice(0, 3).map((tag) => <span className="mobile-tag" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length > 3 && <button type="button" className="mobile-inline-link" onClick={() => setTagPickerOpen((value) => !value)}>更多</button>}</div></div>
+      <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={() => { setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
+      {tagPickerOpen && viewMode === "edit" && <div className="mobile-tag-picker"><div className="mobile-tag-options">{tags.map((tag) => <label key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="mobile-tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="mobile-secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
+      {showReferencePicker && <div className="mobile-reference-picker"><div className="mobile-reference-picker__header"><strong>选择目标章节</strong><button type="button" className="mobile-text-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><p>只新增引用，共享核心不复制。</p><div className="mobile-reference-tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
+      {organizeMode && selectedPlacement && <div className="mobile-move-panel"><label htmlFor="mobile-point-move">移动当前引用到章节</label><select id="mobile-point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
+      {contentLoading ? <p className="mobile-loading">正在读取知识点内容……</p> : viewMode === "edit" ? <div className="content-edit-stack mobile-content-stack"><div className="content-group-heading"><div><h2>共享核心</h2><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>自动保存</span></div><RichTextEditor value={chapterNoteDraft} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack mobile-content-stack">{!hasReadableContent ? <div className="no-content-state"><p>暂无内容，点击“编辑”开始整理。</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h2>共享核心</h2><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h2>本章补充</h2><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
+      <nav className="mobile-point-navigation" aria-label="知识点阅读导航"><button type="button" disabled={currentIndex <= 0} onClick={() => navigateKnowledgePoint(-1)}>← {currentIndex > 0 ? pointMap.get(placements[currentIndex - 1]?.knowledge_point_id)?.title ?? "上一篇" : "上一篇"}</button><button type="button" onClick={() => selectedChapterId && selectChapter(selectedChapterId)}>返回目录</button><button type="button" disabled={currentIndex < 0 || currentIndex >= placements.length - 1} onClick={() => navigateKnowledgePoint(1)}>{currentIndex >= 0 && currentIndex < placements.length - 1 ? pointMap.get(placements[currentIndex + 1]?.knowledge_point_id)?.title ?? "下一篇" : "下一篇"} →</button></nav>
+    </div>;
+  };
+
+  const renderMobileSearch = () => <div className="mobile-page mobile-search-page">
+    <header className="mobile-header"><button type="button" className="mobile-back-button" onClick={() => { setMobileSearchOpen(false); setSearchQuery(""); }}>‹ 我的讲义</button><h1>搜索讲义</h1><button type="button" className="mobile-icon-button" aria-label="搜索筛选" onClick={() => setMobileSheet("filters")}>···</button></header>
+    <label className="mobile-search-box"><span aria-hidden="true">⌕</span><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索知识点、例题、灵感……" aria-label="搜索讲义" /></label>
+    <div className="mobile-filter-chips"><button type="button" className={!searchStatus ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} onClick={() => setSearchStatus("")}>全部</button>{(["draft", "needs_improvement", "organized"] as PointStatus[]).map((status) => <button type="button" className={searchStatus === status ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} key={status} onClick={() => setSearchStatus(status)}>{pointStatusLabel(status)}</button>)}<button type="button" className={searchTagId ? "mobile-filter-chip mobile-filter-chip--active" : "mobile-filter-chip"} onClick={() => setMobileSheet("filters")}>{searchTagId ? tags.find((tag) => tag.id === searchTagId)?.name ?? "标签" : "标签"}</button></div>
+    {!searchQuery.trim() ? <p className="mobile-search-empty">输入关键词开始搜索。</p> : searchLoading ? <p className="mobile-loading">正在搜索……</p> : searchError ? <p className="mobile-search-error">{searchError}</p> : searchResults.length === 0 ? <p className="mobile-search-empty">没有搜索结果，换一个关键词试试。</p> : <div className="mobile-search-results">{searchResults.map((result) => <button type="button" className="mobile-search-result" key={result.id} onClick={() => openSearchResult(result)}><strong>{result.title}</strong><span>{result.context?.path ?? result.paths[0] ?? "知识点"}</span><small>{result.match_types.map(matchTypeLabel).join(" · ")}{result.tags.length > 0 ? ` · ${result.tags.map((tag) => tag.name).join(" · ")}` : ""}</small>{result.context?.text && <p>{result.context.text}</p>}</button>)}</div>}
+  </div>;
+
+  const renderMobileSheet = () => {
+    if (!mobileSheet) return null;
+    const sheetTitle = mobileSheet === "menu" ? "更多" : mobileSheet === "new" ? "新建" : mobileSheet === "chapter" ? "章节操作" : mobileSheet === "point" ? "知识点操作" : mobileSheet === "placements" ? "所在章节" : "筛选";
+    return <div className="mobile-sheet-backdrop" role="presentation" onClick={() => setMobileSheet(null)}><section className="mobile-sheet" role="dialog" aria-modal="true" aria-label={sheetTitle} onClick={(event) => event.stopPropagation()}><div className="mobile-sheet__handle" aria-hidden="true" /><div className="mobile-sheet__header"><h2>{sheetTitle}</h2><button type="button" className="mobile-text-button" onClick={() => setMobileSheet(null)}>关闭</button></div><div className="mobile-sheet__items">
+      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button></>}
+      {mobileSheet === "new" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); createChapter(selectedChapter.id); }}>新建子章节</button><button type="button" onClick={() => { setMobileSheet(null); createKnowledgePoint(selectedChapter.id); }}>新建知识点</button></>}
+      {mobileSheet === "chapter" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); togglePin("chapter", selectedChapter.id); }}>{isPinned("chapter", selectedChapter.id) ? "取消置顶章节" : "置顶章节"}</button><button type="button" onClick={() => { setMobileSheet(null); renameChapter(selectedChapter); }}>重命名章节</button><button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteChapter(selectedChapter); }}>删除章节</button></>}
+      {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
+      {mobileSheet === "placements" && (selectedKnowledgePoint ? pointPlacementsForMobile(selectedKnowledgePoint) : []).map((placement) => <button type="button" key={placement.id} onClick={() => { setMobileSheet(null); selectKnowledgePoint(placement); }}>{chapterPath(placement.chapter_id)}{placement.id === selectedPlacement?.id ? " · 当前" : ""}</button>)}
+      {mobileSheet === "filters" && <><button type="button" onClick={() => { setSearchTagId(""); setMobileSheet(null); }}>全部标签</button>{tags.map((tag) => <button type="button" key={tag.id} onClick={() => { setSearchTagId(tag.id); setMobileSheet(null); }}>{tag.name}{searchTagId === tag.id ? " · 当前" : ""}</button>)}</>}
+    </div></section></div>;
+  };
+
+  const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}</section></main>;
+
+  if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
