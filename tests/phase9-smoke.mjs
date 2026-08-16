@@ -37,9 +37,16 @@ for (const marker of [
   "placementId",
   "本章补充",
   "当前修改尚未成功保存，请先完成保存后再导出",
+  "悠扬讲义",
+  "笨蛋也能学好英语",
+  "favorite-entry",
+  "chapter-new-child",
+  "chapter-create-point",
 ]) assert.match(app, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `app marker: ${marker}`);
 
-for (const marker of ["phase9-overlay-backdrop", "phase9-panel", "phase9-export-browser", "phase9-export-selected", "@media (max-width: 900px)"]) {
+assert.doesNotMatch(app, /<section className="fast-section chapter-section"/, "desktop home keeps chapters in the left tree only");
+
+for (const marker of ["phase9-overlay-backdrop", "phase9-panel", "phase9-export-browser", "phase9-export-selected", "@media (max-width: 900px)", "--ui-action", "--ui-success", "--ui-pending", "home-signature"]) {
   assert.match(styles, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `style marker: ${marker}`);
 }
 
