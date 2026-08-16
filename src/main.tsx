@@ -111,6 +111,30 @@ type SearchResult = {
 };
 type DiscoveryMeta = { tags: Tag[]; favorite: boolean; pinned: { id: string } | null };
 type FastAccess = { recent: AccessItem[]; favorites: AccessItem[]; pins: PinItem[] };
+type HistoryKind = "shared" | "placement";
+type HistorySnapshot = { title: string; status: PointStatus; content: ContentDraft };
+type HistoryVersion = {
+  id: string;
+  knowledge_point_id?: string;
+  placement_id?: string;
+  snapshot?: HistorySnapshot;
+  chapter_note_snapshot?: RichDocument;
+  content_hash: string;
+  version_source: string;
+  created_at: string;
+};
+type RecycleItem = {
+  id: string;
+  item_type: "chapter" | "knowledge_point";
+  title: string;
+  path: string;
+  status?: PointStatus;
+  deleted_at: string | null;
+  deletion_batch_id?: string | null;
+  parent_deleted?: boolean;
+  placement_count?: number;
+  active_placement_count?: number;
+};
 
 const EMPTY_TREE: TreeData = { chapters: [], knowledge_points: [], knowledge_point_placements: [] };
 const AUTOSAVE_DELAY = 800;
@@ -191,6 +215,7 @@ function saveStateLabel(state: SaveState) { return { idle: "等待编辑", dirty
 function pointStatusLabel(status: PointStatus) { return POINT_STATUS_LABELS[status]; }
 function matchTypeLabel(type: string) { return ({ title: "标题命中", explanation: "知识讲解命中", exercises: "例题命中", supplement: "补充内容命中", inspiration: "灵感命中", chapter_note: "本章补充命中", tag: "标签命中" } as Record<string, string>)[type] ?? type; }
 function sortByOrder<T extends { sort_order: number; created_at: string }>(items: T[]) { return [...items].sort((a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at)); }
+function formatDateTime(value: string) { return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
 
 function SaveBadge({ state }: { state: SaveState }) {
   return <span className={`save-badge save-badge--${state}`} role="status" aria-live="polite"><span className="save-badge__dot" aria-hidden="true" />{saveStateLabel(state)}</span>;
@@ -271,11 +296,27 @@ function App() {
   const [isMobile, setIsMobile] = useState(() => window.matchMedia("(max-width: 900px)").matches);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [mobileSheet, setMobileSheet] = useState<"menu" | "new" | "chapter" | "point" | "placements" | "filters" | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyKind, setHistoryKind] = useState<HistoryKind>("shared");
+  const [historyVersions, setHistoryVersions] = useState<HistoryVersion[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyPreview, setHistoryPreview] = useState<HistoryVersion | null>(null);
+  const [historyConfirm, setHistoryConfirm] = useState<HistoryVersion | null>(null);
+  const [historyRestoring, setHistoryRestoring] = useState(false);
+  const [recycleOpen, setRecycleOpen] = useState(false);
+  const [recycleFilter, setRecycleFilter] = useState<"all" | "chapter" | "knowledge_point">("all");
+  const [recycleItems, setRecycleItems] = useState<RecycleItem[]>([]);
+  const [recycleActiveChapters, setRecycleActiveChapters] = useState<Array<{ id: string; title: string; path: string }>>([]);
+  const [recycleLoading, setRecycleLoading] = useState(false);
+  const [recycleRestoreTarget, setRecycleRestoreTarget] = useState<RecycleItem | null>(null);
+  const [recycleTargetChapterId, setRecycleTargetChapterId] = useState("");
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const contentVersionRef = useRef(0);
   const contentRequestRef = useRef(0);
   const noteContextRef = useRef<string | null>(null);
+  const pointEditSessionRef = useRef<{ key: string; snapshot: HistorySnapshot; captured: boolean } | null>(null);
+  const placementEditSessionRef = useRef<{ key: string; snapshot: RichDocument; captured: boolean } | null>(null);
 
   const selectedChapter = tree.chapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
   const selectedKnowledgePoint = tree.knowledge_points.find((point) => point.id === selectedKnowledgePointId) ?? null;
@@ -315,6 +356,114 @@ function App() {
   }, []);
 
   const refreshFastAccess = useCallback(() => { void loadFastAccess(); }, [loadFastAccess]);
+
+  const refreshPointContent = useCallback(async (pointId: string) => {
+    const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
+    setContentRecord(result.content);
+    setContentDraft(contentDraftFromRecord(result.content));
+    setTitleDraft(result.knowledge_point.title);
+    setContentDirty(false);
+    pendingContentFieldsRef.current.clear();
+  }, []);
+
+  const loadHistory = useCallback(async (kind: HistoryKind, id: string) => {
+    setHistoryLoading(true);
+    try {
+      const params: Record<string, string> = kind === "shared" ? { kind, knowledge_point_id: id } : { kind, placement_id: id };
+      const result = await requestJson<{ ok: true; versions: HistoryVersion[] }>(endpoint("history", params));
+      setHistoryVersions(result.versions ?? []);
+      setHistoryPreview(null);
+    } catch (error) {
+      setHistoryVersions([]);
+      setMessage(error instanceof Error ? error.message : "历史版本读取失败。");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  const openHistory = (kind: HistoryKind = "shared") => {
+    const id = kind === "shared" ? selectedKnowledgePointId : selectedPlacementId;
+    if (!id) return;
+    setHistoryKind(kind);
+    setHistoryOpen(true);
+    void loadHistory(kind, id);
+  };
+
+  const previewHistory = (version: HistoryVersion) => {
+    void requestJson<{ ok: true; version: HistoryVersion }>(endpoint("history_version", { kind: historyKind, id: version.id }))
+      .then((result) => setHistoryPreview(result.version))
+      .catch((error) => setMessage(error instanceof Error ? error.message : "历史版本读取失败。"));
+  };
+
+  const restoreHistoryVersion = async () => {
+    if (!historyConfirm) return;
+    setHistoryRestoring(true);
+    try {
+      await requestJson(endpoint("restore_history"), { method: "POST", body: JSON.stringify({ kind: historyKind, version_id: historyConfirm.id }) });
+      if (selectedKnowledgePointId) {
+        await refreshPointContent(selectedKnowledgePointId);
+        await loadTree({ chapterId: selectedChapterId ?? undefined, knowledgePointId: selectedKnowledgePointId });
+      }
+      setHistoryConfirm(null);
+      setHistoryPreview(null);
+      setHistoryOpen(false);
+      setViewMode("read");
+      setMessage("已恢复历史版本；恢复前内容也已保留为可恢复快照。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "历史版本恢复失败。");
+    } finally {
+      setHistoryRestoring(false);
+    }
+  };
+
+  const loadRecycleBin = useCallback(async (kind: "all" | "chapter" | "knowledge_point" = recycleFilter) => {
+    setRecycleLoading(true);
+    try {
+      const result = await requestJson<{ ok: true; items: RecycleItem[]; active_chapters: Array<{ id: string; title: string; path: string }> }>(endpoint("recycle_bin", { kind }));
+      setRecycleItems(result.items ?? []);
+      setRecycleActiveChapters(result.active_chapters ?? []);
+    } catch (error) {
+      setRecycleItems([]);
+      setMessage(error instanceof Error ? error.message : "回收站读取失败。");
+    } finally {
+      setRecycleLoading(false);
+    }
+  }, [recycleFilter]);
+
+  const openRecycleBin = (kind: "all" | "chapter" | "knowledge_point" = "all") => {
+    setRecycleFilter(kind);
+    setRecycleOpen(true);
+    void loadRecycleBin(kind);
+  };
+
+  const restoreRecycleItem = async (item: RecycleItem, restoreParents = false, targetChapterId?: string) => {
+    try {
+      await requestJson(endpoint("restore_recycle"), {
+        method: "POST",
+        body: JSON.stringify({ kind: item.item_type, id: item.id, restore_parents: restoreParents, target_chapter_id: targetChapterId ?? null }),
+      });
+      await loadTree({ chapterId: selectedChapterId ?? undefined, knowledgePointId: selectedKnowledgePointId ?? undefined });
+      await loadRecycleBin(recycleFilter);
+      setRecycleRestoreTarget(null);
+      setMessage(`${item.item_type === "chapter" ? "章节" : "知识点"}已恢复，原 UUID 与可用引用保持不变。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "回收站恢复失败。");
+    }
+  };
+
+  const requestRecycleRestore = (item: RecycleItem) => {
+    if (item.item_type === "chapter" && item.parent_deleted) {
+      if (!window.confirm("上级章节也在回收站中。是否同时恢复上级目录？")) return;
+      void restoreRecycleItem(item, true);
+      return;
+    }
+    if (item.item_type === "knowledge_point" && !item.active_placement_count) {
+      setRecycleRestoreTarget(item);
+      setRecycleTargetChapterId(recycleActiveChapters[0]?.id ?? "");
+      return;
+    }
+    void restoreRecycleItem(item);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -379,6 +528,7 @@ function App() {
 
   useEffect(() => {
     const pointId = selectedKnowledgePointId;
+    pointEditSessionRef.current = null;
     if (!pointId) {
       setContentRecord(null); setContentDraft(emptyContentDraft()); setContentDirty(false); setTitleDraft(""); pendingContentFieldsRef.current.clear(); return;
     }
@@ -401,6 +551,7 @@ function App() {
   useEffect(() => {
     if (noteContextRef.current === selectedPlacementId) return;
     noteContextRef.current = selectedPlacementId;
+    placementEditSessionRef.current = null;
     if (!selectedPlacementId) {
       setChapterNoteDraft(emptyDocument());
       setChapterNoteDirty(false);
@@ -549,7 +700,7 @@ function App() {
   });
   const renameKnowledgePoint = (point: KnowledgePoint) => {
     const title = window.prompt("重命名知识点", point.title); if (title === null || !title.trim() || title.trim() === point.title) return;
-    void mutate(async () => { const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint }>(endpoint("knowledge_point", { id: point.id }), { method: "PATCH", body: JSON.stringify({ title: title.trim() }) }); setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((item) => item.id === point.id ? result.knowledge_point : item) })); setTitleDraft(result.knowledge_point.title); setMessage("知识点名称已更新。"); });
+    void mutate(async () => { capturePointHistory(); const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint }>(endpoint("knowledge_point", { id: point.id }), { method: "PATCH", body: JSON.stringify({ title: title.trim() }) }); setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((item) => item.id === point.id ? result.knowledge_point : item) })); setTitleDraft(result.knowledge_point.title); setMessage("知识点名称已更新。"); });
   };
   const deleteKnowledgePoint = (point: KnowledgePoint) => {
     const placementCount = tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id).length;
@@ -592,18 +743,54 @@ function App() {
   const handleChapterDrop = (event: DragEvent<HTMLDivElement>, target: Chapter) => { event.preventDefault(); const sourceId = event.dataTransfer.getData("chapter-id") || draggedChapterId; setDraggedChapterId(null); if (!organizeMode || !sourceId) return; const source = chapterMap.get(sourceId); if (source && source.parent_id === target.parent_id) reorderSiblings(source.id, target.id, target.parent_id); };
   const handlePointDrop = (event: DragEvent<HTMLDivElement>, target: Placement) => { event.preventDefault(); const sourceId = event.dataTransfer.getData("placement-id") || draggedPlacementId; setDraggedPlacementId(null); if (!organizeMode || !sourceId) return; const source = tree.knowledge_point_placements.find((item) => item.id === sourceId); if (source && source.chapter_id === target.chapter_id) reorderKnowledgePoints(source.id, target.id, target.chapter_id); };
 
+  const ensurePointEditSession = () => {
+    if (!selectedKnowledgePoint || pointEditSessionRef.current?.key === selectedKnowledgePoint.id) return;
+    pointEditSessionRef.current = {
+      key: selectedKnowledgePoint.id,
+      snapshot: JSON.parse(JSON.stringify({ title: selectedKnowledgePoint.title, status: selectedKnowledgePoint.status, content: contentDraft })) as HistorySnapshot,
+      captured: false,
+    };
+  };
+  const beginPointEdit = () => {
+    if (!selectedKnowledgePoint) return;
+    ensurePointEditSession();
+    setTitleDraft(selectedKnowledgePoint.title);
+    setViewMode("edit");
+  };
+  const capturePointHistory = () => {
+    ensurePointEditSession();
+    const session = pointEditSessionRef.current;
+    if (!session || session.captured || !selectedKnowledgePointId || session.key !== selectedKnowledgePointId) return;
+    session.captured = true;
+    void requestJson(endpoint("history"), { method: "POST", body: JSON.stringify({ kind: "shared", knowledge_point_id: session.key, snapshot: session.snapshot }) })
+      .catch((error) => setMessage(`历史快照保存失败，正文仍会继续保存：${error instanceof Error ? error.message : "网络连接异常。"}`));
+  };
+  const capturePlacementHistory = () => {
+    const session = placementEditSessionRef.current;
+    if (!session || session.captured || !selectedPlacementId || session.key !== selectedPlacementId) return;
+    session.captured = true;
+    void requestJson(endpoint("history"), { method: "POST", body: JSON.stringify({ kind: "placement", placement_id: session.key, snapshot: session.snapshot }) })
+      .catch((error) => setMessage(`本章补充历史快照保存失败，正文仍会继续保存：${error instanceof Error ? error.message : "网络连接异常。"}`));
+  };
+
   const updateChapterContent = (content: string) => { if (!selectedChapterId) return; setTree((previous) => ({ ...previous, chapters: previous.chapters.map((chapter) => chapter.id === selectedChapterId ? { ...chapter, content } : chapter) })); setSaveState("dirty"); };
   const updateContentSection = (section: ContentSection, value: RichDocument) => {
+    capturePointHistory();
     setContentDraft((previous) => ({ ...previous, [section]: value })); pendingContentFieldsRef.current.add(section); contentVersionRef.current += 1; setContentDirty(true); setSaveState("dirty");
     try { window.localStorage.setItem(`${CONTENT_DRAFT_PREFIX}${selectedKnowledgePointId}`, JSON.stringify({ ...contentDraft, [section]: value, savedAt: new Date().toISOString() })); } catch { /* Temporary protection is best effort. */ }
   };
   const updateChapterNote = (value: RichDocument) => {
     if (!selectedPlacement) return;
+    if (!placementEditSessionRef.current || placementEditSessionRef.current.key !== selectedPlacement.id) {
+      placementEditSessionRef.current = { key: selectedPlacement.id, snapshot: JSON.parse(JSON.stringify(chapterNoteDraft)) as RichDocument, captured: false };
+    }
+    capturePlacementHistory();
     setChapterNoteDraft(value); setChapterNoteDirty(true); setSaveState("dirty");
     try { window.localStorage.setItem(`${CHAPTER_NOTE_DRAFT_PREFIX}${selectedPlacement.id}`, JSON.stringify({ value, savedAt: new Date().toISOString() })); } catch { /* Temporary protection is best effort. */ }
   };
   const savePointMetadata = async (patch: Partial<Pick<KnowledgePoint, "title" | "status">>) => {
     if (!selectedKnowledgePoint) return; setSaveState("saving"); setMessage("");
+    capturePointHistory();
     try {
       const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint }>(endpoint("knowledge_point", { id: selectedKnowledgePoint.id }), { method: "PATCH", body: JSON.stringify(patch) });
       setTree((previous) => ({ ...previous, knowledge_points: previous.knowledge_points.map((point) => point.id === result.knowledge_point.id ? result.knowledge_point : point) })); setTitleDraft(result.knowledge_point.title); setSaveState(contentDirty || chapterNoteDirty ? "dirty" : "saved"); setMessage("知识点信息已保存。");
@@ -647,7 +834,7 @@ function App() {
       <section className="fast-section fast-section--pins"><div className="fast-section__heading"><h3>置顶</h3><span>最多 4 个</span></div>{fastAccess.pins.length === 0 ? <p className="empty-line">还没有置顶项目。</p> : <div className="access-list access-list--pins">{fastAccess.pins.map((item) => renderAccessButton(item, "置顶"))}</div>}</section>
       <section className="fast-section chapter-section"><div className="fast-section__heading"><h3>章节</h3><span>{rootChapters.length} 个一级章节</span></div>{rootChapters.length === 0 ? <div className="empty-state-inline"><strong>暂无章节</strong><span>从这里开始整理你的知识体系。</span><button type="button" className="secondary-button" onClick={() => createChapter(null)}>＋ 新建章节</button></div> : <div className="chapter-grid">{rootChapters.map((chapter) => { const childCount = childrenOf(chapter.id).length; const pointCount = placementsOf(chapter.id).length; return <button type="button" className="chapter-card" key={chapter.id} onClick={() => selectChapter(chapter.id)}><strong>{chapter.title}</strong><span>{childCount > 0 ? `${childCount} 个子章节 · ` : ""}{pointCount > 0 ? `${pointCount} 个知识点` : "进入章节"}</span></button>; })}</div>}</section>
       <section className="fast-section"><div className="fast-section__heading"><h3>最近编辑</h3><span>最多 6 条</span></div>{fastAccess.recent.length === 0 ? <p className="empty-line">还没有最近编辑记录。</p> : <div className="access-list access-list--recent">{fastAccess.recent.map((item) => renderAccessButton(item))}</div>}</section>
-      <section className="fast-section fast-section--favorites"><div className="fast-section__heading"><h3>收藏</h3><button type="button" className="text-link" onClick={() => setShowFavorites((value) => !value)}>{showFavorites ? "收起" : `查看全部（${fastAccess.favorites.length}）`} <span aria-hidden="true">→</span></button></div>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="empty-line">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="access-list">{fastAccess.favorites.map((item) => renderAccessButton(item, "收藏"))}</div>)}</section>
+      <section className="fast-section fast-section--favorites"><div className="fast-section__heading"><h3>收藏</h3><div className="fast-section__actions"><button type="button" className="text-link" onClick={() => setShowFavorites((value) => !value)}>{showFavorites ? "收起" : `查看全部（${fastAccess.favorites.length}）`} <span aria-hidden="true">→</span></button><button type="button" className="text-link" onClick={() => openRecycleBin()}>回收站 →</button></div></div>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="empty-line">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="access-list">{fastAccess.favorites.map((item) => renderAccessButton(item, "收藏"))}</div>)}</section>
     </div>;
   };
 
@@ -686,7 +873,7 @@ function App() {
     const hasChapterNote = documentHasText(chapterNoteDraft);
     return <div className="knowledge-point-page">
       <div className="content-heading"><div>{viewMode === "edit" ? <><p className="content-kicker">知识点 · 编辑</p><input className="point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /></> : <><p className="content-kicker">知识点 · 阅读</p><h2>{selectedKnowledgePoint.title}</h2></>}<p className="content-hint">当前 placement：{selectedChapter ? chapterPath(selectedChapter.id) : "当前目录"}</p></div><SaveBadge state={saveState} /></div>
-      <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={() => { setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button>{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
+      <div className="action-row point-actions"><span className="large-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span><button className="quiet-button favorite-action" disabled={busy || !pointMeta} onClick={toggleFavorite}>{pointMeta?.favorite ? "★ 已收藏" : "☆ 收藏"}</button>{viewMode === "read" ? <button className="primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="status-select-label" htmlFor="point-status">状态</label><select id="point-status" className="status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button className="quiet-button" onClick={() => setViewMode("read")}>完成</button></>}<details className="more-menu"><summary aria-label="知识点更多操作">···</summary><div className="more-menu__content"><button type="button" disabled={busy} onClick={() => togglePin("knowledge_point", selectedKnowledgePoint.id)}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶" : "置顶知识点"}</button><button type="button" disabled={referenceBusy} onClick={() => setShowReferencePicker((value) => !value)}>添加到其他章节</button><button type="button" onClick={() => openHistory("shared")}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => openHistory("placement")}>本章补充历史</button>}{organizeMode && <button type="button" disabled={busy} onClick={() => renameKnowledgePoint(selectedKnowledgePoint)}>重命名</button>}<button type="button" disabled={busy || !selectedPlacement} onClick={removeCurrentPlacement}>从当前章节移除</button><button type="button" className="more-menu__danger" disabled={busy} onClick={() => deleteKnowledgePoint(selectedKnowledgePoint)}>删除知识点</button></div></details></div>
       <div className="tag-strip"><span className="tag-strip__label">标签</span>{(pointMeta?.tags ?? []).map((tag) => <span className="tag-chip" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length === 0 && <span className="empty-line">暂无标签</span>}{viewMode === "edit" && <button type="button" className="quiet-button tag-edit-button" onClick={() => setTagPickerOpen((value) => !value)}>{tagPickerOpen ? "收起标签" : "编辑标签"}</button>}</div>
       {tagPickerOpen && viewMode === "edit" && <div className="tag-picker"><div className="tag-picker__options">{tags.map((tag) => <label className="tag-option" key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="reference-picker"><div className="reference-picker__header"><div><strong>选择目标章节</strong><span>只新增 placement，共享核心不复制。</span></div><button type="button" className="quiet-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><div className="reference-picker__tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
@@ -694,6 +881,36 @@ function App() {
       {organizeMode && selectedPlacement && <div className="move-panel"><label htmlFor="point-move">移动当前引用到章节</label><select id="point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
       {contentLoading ? <div className="content-loading content-loading--compact">正在读取知识点内容……</div> : viewMode === "edit" ? <div className="content-edit-stack"><div className="content-group-heading"><div><h3>共享核心</h3><span>修改后会同步到所有引用位置</span></div></div>{CONTENT_SECTIONS.map((section) => <section className={`content-section content-section--${section}`} key={section}><div className="content-section__heading"><h3>{SECTION_LABELS[section]}</h3><span>共享内容</span></div><RichTextEditor value={contentDraft[section]} onChange={(value) => updateContentSection(section, value)} /></section>)}<div className="content-group-heading content-group-heading--chapter"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--chapter-note"><div className="content-section__heading"><h3>本章补充</h3><span>自动保存</span></div><RichTextEditor value={chapterNoteDraft} onChange={updateChapterNote} /></section></div> : <div className="content-read-stack">{!hasReadableContent ? <div className="no-content-state"><span>○</span><p>{contentRecord ? "暂无内容" : "暂无内容，点击“编辑”开始整理。"}</p></div> : <><div className="content-group-heading content-group-heading--read"><div><h3>共享核心</h3><span>所有引用位置共同使用</span></div></div>{CONTENT_SECTIONS.filter((section) => documentHasText(contentDraft[section])).map((section) => <section className={`content-section content-section--read content-section--${section}`} key={section}><h3>{SECTION_LABELS[section]}</h3><RichTextViewer value={contentDraft[section]} /></section>)}</>}{hasChapterNote && <><div className="content-group-heading content-group-heading--chapter content-group-heading--read"><div><h3>本章补充</h3><span>仅当前章节可见</span></div></div><section className="content-section content-section--read content-section--chapter-note"><RichTextViewer value={chapterNoteDraft} /></section></>}</div>}
       <nav className="point-navigation" aria-label="知识点阅读导航"><button className="quiet-button" disabled={currentIndex <= 0} onClick={() => navigateKnowledgePoint(-1)}>上一篇</button><button className="secondary-button" onClick={() => selectChapter(selectedChapterId ?? "")}>返回目录</button><button className="quiet-button" disabled={currentIndex < 0 || currentIndex >= placements.length - 1} onClick={() => navigateKnowledgePoint(1)}>下一篇</button></nav>
+    </div>;
+  };
+
+  const renderHistoryDrawer = () => {
+    if (!historyOpen) return null;
+    const previewSnapshot = historyPreview?.snapshot;
+    return <div className="phase8-overlay-backdrop" role="presentation" onMouseDown={() => { if (!historyRestoring) setHistoryOpen(false); }}>
+      <section className="phase8-panel phase8-history" role="dialog" aria-modal="true" aria-label="历史版本" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="phase8-panel__header"><div><p className="content-kicker">可逆编辑记录</p><h2>历史版本</h2><span>按一次编辑会话记录，不会把每次自动保存都拆成一条。</span></div><button type="button" className="quiet-button" onClick={() => setHistoryOpen(false)}>关闭</button></header>
+        <div className="phase8-tabs"><button type="button" className={historyKind === "shared" ? "phase8-tab phase8-tab--active" : "phase8-tab"} onClick={() => { if (selectedKnowledgePointId) { setHistoryKind("shared"); void loadHistory("shared", selectedKnowledgePointId); } }}>共享核心</button>{selectedPlacementId && <button type="button" className={historyKind === "placement" ? "phase8-tab phase8-tab--active" : "phase8-tab"} onClick={() => { setHistoryKind("placement"); void loadHistory("placement", selectedPlacementId); }}>本章补充</button>}</div>
+        <div className="phase8-history__body">
+          <div className="phase8-history__list">{historyLoading ? <p className="empty-line">正在读取历史版本……</p> : historyVersions.length === 0 ? <div className="phase8-empty"><strong>暂无历史版本</strong><span>下一次进入编辑并产生变化时，会保存一个可恢复快照。</span></div> : historyVersions.map((version) => <article className={historyPreview?.id === version.id ? "phase8-history-item phase8-history-item--active" : "phase8-history-item"} key={version.id}><div><strong>{formatDateTime(version.created_at)}</strong><span>{version.version_source === "before_restore" ? "恢复前当前版本" : "编辑前版本"}</span></div><div className="phase8-history-item__actions"><button type="button" className="quiet-button" onClick={() => previewHistory(version)}>查看预览</button><button type="button" className="secondary-button" onClick={() => setHistoryConfirm(version)}>恢复此版本</button></div></article>)}</div>
+          {historyPreview && <aside className="phase8-history__preview"><div className="phase8-preview-heading"><div><p className="content-kicker">只读预览</p><h3>{historyKind === "shared" ? previewSnapshot?.title ?? "共享核心" : "本章补充"}</h3><span>{formatDateTime(historyPreview.created_at)}</span></div><button type="button" className="quiet-button" onClick={() => setHistoryPreview(null)}>收起</button></div>{historyKind === "shared" && previewSnapshot ? <div className="phase8-preview-sections">{CONTENT_SECTIONS.map((section) => <section key={section}><h4>{SECTION_LABELS[section]}</h4><RichTextViewer value={previewSnapshot.content[section]} /></section>)}</div> : historyPreview.chapter_note_snapshot ? <RichTextViewer value={historyPreview.chapter_note_snapshot} /> : <p className="empty-line">此版本没有可预览内容。</p>}<button type="button" className="primary-button" onClick={() => setHistoryConfirm(historyPreview)}>恢复此版本</button></aside>}
+        </div>
+      </section>
+      {historyConfirm && <div className="phase8-confirm-backdrop" role="presentation"><section className="phase8-confirm" role="dialog" aria-modal="true" aria-label="确认恢复历史版本" onMouseDown={(event) => event.stopPropagation()}><h3>恢复这个历史版本？</h3><p>恢复前的当前内容会先保存为新的“恢复前当前版本”，之后仍然可以撤回。</p><div className="phase8-confirm__actions"><button type="button" className="quiet-button" disabled={historyRestoring} onClick={() => setHistoryConfirm(null)}>取消</button><button type="button" className="primary-button" disabled={historyRestoring} onClick={() => void restoreHistoryVersion()}>{historyRestoring ? "恢复中……" : "确认恢复"}</button></div></section></div>}
+    </div>;
+  };
+
+  const renderRecycleBin = () => {
+    if (!recycleOpen) return null;
+    const filterLabel = recycleFilter === "all" ? "全部" : recycleFilter === "chapter" ? "章节" : "知识点";
+    return <div className="phase8-overlay-backdrop" role="presentation" onMouseDown={() => setRecycleOpen(false)}>
+      <section className="phase8-panel phase8-recycle" role="dialog" aria-modal="true" aria-label="回收站" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="phase8-panel__header"><div><p className="content-kicker">可逆删除</p><h2>回收站</h2><span>这里不会永久删除内容；恢复会保留原 UUID。</span></div><button type="button" className="quiet-button" onClick={() => setRecycleOpen(false)}>关闭</button></header>
+        <div className="phase8-tabs">{(["all", "chapter", "knowledge_point"] as const).map((kind) => <button type="button" key={kind} className={recycleFilter === kind ? "phase8-tab phase8-tab--active" : "phase8-tab"} onClick={() => { setRecycleFilter(kind); void loadRecycleBin(kind); }}>{kind === "all" ? "全部" : kind === "chapter" ? "章节" : "知识点"}</button>)}</div>
+        {recycleLoading ? <p className="empty-line">正在读取回收站……</p> : recycleItems.length === 0 ? <div className="phase8-empty"><strong>{filterLabel}回收站为空</strong><span>被软删除的章节和知识点会保留在这里，等待恢复。</span></div> : <div className="phase8-recycle__list">{recycleItems.map((item) => <article className="phase8-recycle-item" key={`${item.item_type}-${item.id}`}><div className="phase8-recycle-item__main"><strong>{item.title}</strong><span>{item.item_type === "chapter" ? "章节" : "知识点"} · {item.path}</span>{item.item_type === "knowledge_point" && <small>{item.placement_count ?? 0} 个原引用 · {item.active_placement_count ?? 0} 个当前可用引用</small>}<small>移入回收站 · {item.deleted_at ? formatDateTime(item.deleted_at) : "—"}</small></div><button type="button" className="secondary-button" onClick={() => requestRecycleRestore(item)}>恢复</button></article>)}</div>}
+        <p className="phase8-note">不提供永久删除和自动清理；回收站只用于可逆恢复。</p>
+      </section>
+      {recycleRestoreTarget && <div className="phase8-confirm-backdrop" role="presentation"><section className="phase8-confirm" role="dialog" aria-modal="true" aria-label="选择知识点恢复位置" onMouseDown={(event) => event.stopPropagation()}><h3>选择恢复位置</h3><p>原来的章节引用都不可用，请选择一个当前章节作为新的引用位置。</p><select className="phase8-target-select" value={recycleTargetChapterId} onChange={(event) => setRecycleTargetChapterId(event.target.value)}><option value="">请选择当前章节</option>{recycleActiveChapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.path || chapter.title}</option>)}</select><div className="phase8-confirm__actions"><button type="button" className="quiet-button" onClick={() => setRecycleRestoreTarget(null)}>取消</button><button type="button" className="primary-button" disabled={!recycleTargetChapterId} onClick={() => void restoreRecycleItem(recycleRestoreTarget, false, recycleTargetChapterId)}>恢复到此章节</button></div></section></div>}
     </div>;
   };
 
@@ -725,7 +942,7 @@ function App() {
         <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>置顶</h2><span>最多 4 个</span></div></div>{fastAccess.pins.length === 0 ? <p className="mobile-empty">还没有置顶项目。</p> : <div className="mobile-pin-list">{fastAccess.pins.slice(0, 4).map((item) => renderMobileAccessRow(item, "置顶"))}</div>}</section>
         <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>章节</h2><span>{rootChapters.length} 个一级章节</span></div></div>{rootChapters.length === 0 ? <p className="mobile-empty">还没有章节，从这里开始整理你的知识体系。</p> : <div className="mobile-chapter-list">{rootChapters.map((chapter) => <button type="button" className="mobile-list-row" key={chapter.id} onClick={() => selectChapter(chapter.id)}><span>{chapter.title}</span><span aria-hidden="true">›</span></button>)}</div>}</section>
         <section className="mobile-home-section"><div className="mobile-section-heading"><div><h2>最近编辑</h2><span>最多 6 条</span></div></div>{fastAccess.recent.length === 0 ? <p className="mobile-empty">还没有最近编辑记录。</p> : <div className="mobile-access-list">{fastAccess.recent.slice(0, 6).map((item) => renderMobileAccessRow(item))}</div>}</section>
-        <section className="mobile-home-section mobile-home-section--favorites"><button type="button" className="mobile-light-link" onClick={() => setShowFavorites((value) => !value)}>收藏 <span>（{fastAccess.favorites.length}）</span><b aria-hidden="true">›</b></button>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="mobile-empty">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="mobile-access-list">{fastAccess.favorites.map((item) => renderMobileAccessRow(item, "收藏"))}</div>)}</section>
+        <section className="mobile-home-section mobile-home-section--favorites"><button type="button" className="mobile-light-link" onClick={() => setShowFavorites((value) => !value)}>收藏 <span>（{fastAccess.favorites.length}）</span><b aria-hidden="true">›</b></button><button type="button" className="mobile-light-link" onClick={() => openRecycleBin()}>回收站 <b aria-hidden="true">›</b></button>{showFavorites && (fastAccess.favorites.length === 0 ? <p className="mobile-empty">暂无收藏。收藏常用知识点后，会显示在这里。</p> : <div className="mobile-access-list">{fastAccess.favorites.map((item) => renderMobileAccessRow(item, "收藏"))}</div>)}</section>
       </div>}
     </div>;
   };
@@ -763,7 +980,7 @@ function App() {
       <header className="mobile-header mobile-header--detail"><button type="button" className="mobile-back-button" onClick={() => selectedChapterId ? selectChapter(selectedChapterId) : mobileGoHome()}>‹ {selectedChapter?.title ?? "我的讲义"}</button><div className="mobile-header__actions"><SaveBadge state={saveState} /><button type="button" className="mobile-icon-button" aria-label="知识点更多操作" onClick={() => setMobileSheet("point")}>···</button></div></header>
       {renderMobileMessage()}
       <div className="mobile-point-heading">{viewMode === "edit" ? <input className="mobile-point-title-input" value={titleDraft} onChange={(event) => setTitleDraft(event.target.value)} onBlur={() => { if (titleDraft.trim() && titleDraft.trim() !== selectedKnowledgePoint.title) void savePointMetadata({ title: titleDraft.trim() }); }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label="知识点标题" /> : <h1>{selectedKnowledgePoint.title}</h1>}<div className="mobile-point-meta"><span className="mobile-status-pill">{pointStatusLabel(selectedKnowledgePoint.status)}</span>{(pointMeta?.tags ?? []).slice(0, 3).map((tag) => <span className="mobile-tag" key={tag.id}>{tag.name}</span>)}{(pointMeta?.tags ?? []).length > 3 && <button type="button" className="mobile-inline-link" onClick={() => setTagPickerOpen((value) => !value)}>更多</button>}</div></div>
-      <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={() => { setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
+      <div className="mobile-point-actions">{viewMode === "read" ? <button type="button" className="mobile-primary-button" onClick={beginPointEdit}>编辑</button> : <><label className="mobile-status-select-label" htmlFor="mobile-point-status">状态</label><select id="mobile-point-status" className="mobile-status-select" value={selectedKnowledgePoint.status} onChange={(event) => void savePointMetadata({ status: event.target.value as PointStatus })}><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><button type="button" className="mobile-text-button" onClick={() => setViewMode("read")}>完成</button></>}{pointPlacements.length > 0 && <button type="button" className="mobile-placement-link" onClick={() => setMobileSheet("placements")}>所在章节 · {pointPlacements.length} 个位置</button>}</div>
       {tagPickerOpen && viewMode === "edit" && <div className="mobile-tag-picker"><div className="mobile-tag-options">{tags.map((tag) => <label key={tag.id}><input type="checkbox" checked={pointMeta?.tags.some((item) => item.id === tag.id) ?? false} onChange={() => togglePointTag(tag)} />{tag.name}</label>)}</div><div className="mobile-tag-create"><input value={customTagDraft} onChange={(event) => setCustomTagDraft(event.target.value)} placeholder="新增自定义标签" maxLength={80} /><button type="button" className="mobile-secondary-button" disabled={busy || !customTagDraft.trim()} onClick={createCustomTag}>添加</button></div></div>}
       {showReferencePicker && <div className="mobile-reference-picker"><div className="mobile-reference-picker__header"><strong>选择目标章节</strong><button type="button" className="mobile-text-button" onClick={() => setShowReferencePicker(false)}>取消</button></div><p>只新增引用，共享核心不复制。</p><div className="mobile-reference-tree">{childrenOf(null).map((chapter) => renderChapterChoice(chapter))}</div></div>}
       {organizeMode && selectedPlacement && <div className="mobile-move-panel"><label htmlFor="mobile-point-move">移动当前引用到章节</label><select id="mobile-point-move" value={selectedPlacement.chapter_id} disabled={busy} onChange={(event) => moveKnowledgePoint(selectedPlacement.id, event.target.value)}>{tree.chapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapterPath(chapter.id)}</option>)}</select></div>}
@@ -783,24 +1000,24 @@ function App() {
     if (!mobileSheet) return null;
     const sheetTitle = mobileSheet === "menu" ? "更多" : mobileSheet === "new" ? "新建" : mobileSheet === "chapter" ? "章节操作" : mobileSheet === "point" ? "知识点操作" : mobileSheet === "placements" ? "所在章节" : "筛选";
     return <div className="mobile-sheet-backdrop" role="presentation" onClick={() => setMobileSheet(null)}><section className="mobile-sheet" role="dialog" aria-modal="true" aria-label={sheetTitle} onClick={(event) => event.stopPropagation()}><div className="mobile-sheet__handle" aria-hidden="true" /><div className="mobile-sheet__header"><h2>{sheetTitle}</h2><button type="button" className="mobile-text-button" onClick={() => setMobileSheet(null)}>关闭</button></div><div className="mobile-sheet__items">
-      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button></>}
+      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button><button type="button" onClick={() => { setMobileSheet(null); openRecycleBin(); }}>回收站</button></>}
       {mobileSheet === "new" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); createChapter(selectedChapter.id); }}>新建子章节</button><button type="button" onClick={() => { setMobileSheet(null); createKnowledgePoint(selectedChapter.id); }}>新建知识点</button></>}
       {mobileSheet === "chapter" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); togglePin("chapter", selectedChapter.id); }}>{isPinned("chapter", selectedChapter.id) ? "取消置顶章节" : "置顶章节"}</button><button type="button" onClick={() => { setMobileSheet(null); renameChapter(selectedChapter); }}>重命名章节</button><button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteChapter(selectedChapter); }}>删除章节</button></>}
-      {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); setTitleDraft(selectedKnowledgePoint.title); setViewMode("edit"); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
+      {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); beginPointEdit(); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); openHistory("shared"); }}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => { setMobileSheet(null); openHistory("placement"); }}>本章补充历史</button>}<button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
       {mobileSheet === "placements" && (selectedKnowledgePoint ? pointPlacementsForMobile(selectedKnowledgePoint) : []).map((placement) => <button type="button" key={placement.id} onClick={() => { setMobileSheet(null); selectKnowledgePoint(placement); }}>{chapterPath(placement.chapter_id)}{placement.id === selectedPlacement?.id ? " · 当前" : ""}</button>)}
       {mobileSheet === "filters" && <><button type="button" onClick={() => { setSearchTagId(""); setMobileSheet(null); }}>全部标签</button>{tags.map((tag) => <button type="button" key={tag.id} onClick={() => { setSearchTagId(tag.id); setMobileSheet(null); }}>{tag.name}{searchTagId === tag.id ? " · 当前" : ""}</button>)}</>}
     </div></section></div>;
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}</section></main>;
 
   if (isMobile) return renderMobileShell();
   return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">个人英语讲义工作台</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
-    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>个人英语讲义工作台</span></footer></section></main>;
+    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>个人英语讲义工作台</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }

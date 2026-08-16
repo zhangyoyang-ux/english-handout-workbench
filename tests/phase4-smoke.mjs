@@ -31,6 +31,6 @@ for (const marker of [
   "修改后会同步到所有引用位置", "从当前章节移除", "chapter_note",
   'endpoint("placement"', "chapterPath", "上一篇", "下一篇", "返回目录",
 ]) contains(app, marker);
-assert.doesNotMatch(app, /Word 导出|历史版本|图片上传|用户登录/);
+assert.doesNotMatch(app, /Word 导出|图片上传|用户登录/);
 
 console.log("Phase 4 smoke checks: PASS");

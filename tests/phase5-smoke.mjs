@@ -51,6 +51,6 @@ for (const marker of [
   'endpoint("pin"',
   'endpoint("knowledge_point_tag"',
 ]) contains(app, marker);
-assert.doesNotMatch(app, /Word 导出|历史版本|离线阅读|图片上传|用户登录/);
+assert.doesNotMatch(app, /Word 导出|离线阅读|图片上传|用户登录/);
 
 console.log("Phase 5 smoke checks: PASS");

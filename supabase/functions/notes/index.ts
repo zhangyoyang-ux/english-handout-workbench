@@ -52,6 +52,27 @@ type KnowledgePointPlacement = {
   chapter_note: RichDocument;
   created_at: string;
   deleted_at: string | null;
+  deletion_batch_id?: string | null;
+};
+
+type HistoryKind = "shared" | "placement";
+
+type KnowledgePointVersion = {
+  id: string;
+  knowledge_point_id: string;
+  snapshot: Record<string, unknown>;
+  content_hash: string;
+  version_source: string;
+  created_at: string;
+};
+
+type PlacementNoteVersion = {
+  id: string;
+  placement_id: string;
+  chapter_note_snapshot: RichDocument;
+  content_hash: string;
+  version_source: string;
+  created_at: string;
 };
 
 type Tag = {
@@ -113,6 +134,22 @@ type ReorderPayload = {
   parent_id?: unknown;
   chapter_id?: unknown;
   ids?: unknown;
+};
+
+type HistoryPayload = {
+  kind?: unknown;
+  knowledge_point_id?: unknown;
+  placement_id?: unknown;
+  snapshot?: unknown;
+  version_id?: unknown;
+  target_chapter_id?: unknown;
+};
+
+type RecycleRestorePayload = {
+  kind?: unknown;
+  id?: unknown;
+  restore_parents?: unknown;
+  target_chapter_id?: unknown;
 };
 
 const MAX_TITLE_LENGTH = 200;
@@ -192,6 +229,262 @@ function isRichDocument(value: unknown): value is RichDocument {
   } catch {
     return false;
   }
+}
+
+function isHistoryKind(value: unknown): value is HistoryKind {
+  return value === "shared" || value === "placement";
+}
+
+function defaultRichDocument(): RichDocument {
+  return { type: "doc", content: [{ type: "paragraph" }] };
+}
+
+function isHistorySnapshot(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const snapshot = value as Record<string, unknown>;
+  if (!isNonEmptyTitle(snapshot.title) || typeof snapshot.status !== "string" || !STATUS_VALUES.has(snapshot.status)) return false;
+  const content = snapshot.content;
+  if (typeof content !== "object" || content === null || Array.isArray(content)) return false;
+  return CONTENT_FIELDS.every((field) => isRichDocument((content as Record<string, unknown>)[field]));
+}
+
+async function hashJson(value: unknown) {
+  const encoded = new TextEncoder().encode(JSON.stringify(value));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function readCurrentPointSnapshot(client: SupabaseClient, pointId: string, includeDeleted = false) {
+  const pointQuery = client
+    .from("knowledge_points")
+    .select("id,title,status,deleted_at")
+    .eq("id", pointId);
+  const { data: point, error: pointError } = includeDeleted
+    ? await pointQuery.maybeSingle()
+    : await pointQuery.is("deleted_at", null).maybeSingle();
+  if (pointError) throw pointError;
+  if (!point) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+  const { data: content, error: contentError } = await client
+    .from("knowledge_point_contents")
+    .select("explanation,exercises,supplement,inspiration")
+    .eq("knowledge_point_id", pointId)
+    .maybeSingle();
+  if (contentError) throw contentError;
+  return {
+    title: point.title,
+    status: point.status,
+    content: {
+      explanation: content?.explanation ?? defaultRichDocument(),
+      exercises: content?.exercises ?? defaultRichDocument(),
+      supplement: content?.supplement ?? defaultRichDocument(),
+      inspiration: content?.inspiration ?? defaultRichDocument(),
+    },
+  };
+}
+
+async function createKnowledgePointVersion(client: SupabaseClient, pointId: string, snapshot: unknown) {
+  if (!isUuid(pointId) || !isHistorySnapshot(snapshot)) throw new Error("HISTORY_PAYLOAD_INVALID");
+  const contentHash = await hashJson(snapshot);
+  const { data, error } = await client
+    .from("knowledge_point_versions")
+    .upsert({ knowledge_point_id: pointId, snapshot, content_hash: contentHash }, { onConflict: "knowledge_point_id,content_hash", ignoreDuplicates: true })
+    .select("id,knowledge_point_id,snapshot,content_hash,version_source,created_at")
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return data as KnowledgePointVersion;
+  const { data: existing, error: existingError } = await client
+    .from("knowledge_point_versions")
+    .select("id,knowledge_point_id,snapshot,content_hash,version_source,created_at")
+    .eq("knowledge_point_id", pointId)
+    .eq("content_hash", contentHash)
+    .single();
+  if (existingError) throw existingError;
+  return existing as KnowledgePointVersion;
+}
+
+async function createPlacementNoteVersion(client: SupabaseClient, placementId: string, snapshot: unknown) {
+  if (!isUuid(placementId) || !isRichDocument(snapshot)) throw new Error("HISTORY_PAYLOAD_INVALID");
+  const contentHash = await hashJson(snapshot);
+  const { data, error } = await client
+    .from("placement_note_versions")
+    .upsert({ placement_id: placementId, chapter_note_snapshot: snapshot, content_hash: contentHash }, { onConflict: "placement_id,content_hash", ignoreDuplicates: true })
+    .select("id,placement_id,chapter_note_snapshot,content_hash,version_source,created_at")
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return data as PlacementNoteVersion;
+  const { data: existing, error: existingError } = await client
+    .from("placement_note_versions")
+    .select("id,placement_id,chapter_note_snapshot,content_hash,version_source,created_at")
+    .eq("placement_id", placementId)
+    .eq("content_hash", contentHash)
+    .single();
+  if (existingError) throw existingError;
+  return existing as PlacementNoteVersion;
+}
+
+async function readHistory(client: SupabaseClient, kind: HistoryKind, id: string) {
+  if (!isUuid(id)) throw new Error("HISTORY_PAYLOAD_INVALID");
+  if (kind === "shared") {
+    const { data, error } = await client
+      .from("knowledge_point_versions")
+      .select("id,knowledge_point_id,content_hash,version_source,created_at")
+      .eq("knowledge_point_id", id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return { versions: (data ?? []) as KnowledgePointVersion[] };
+  }
+  const { data, error } = await client
+    .from("placement_note_versions")
+    .select("id,placement_id,content_hash,version_source,created_at")
+    .eq("placement_id", id)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return { versions: (data ?? []) as PlacementNoteVersion[] };
+}
+
+async function readHistoryVersion(client: SupabaseClient, kind: HistoryKind, id: string) {
+  if (!isUuid(id)) throw new Error("HISTORY_PAYLOAD_INVALID");
+  if (kind === "shared") {
+    const { data, error } = await client
+      .from("knowledge_point_versions")
+      .select("id,knowledge_point_id,snapshot,content_hash,version_source,created_at")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) throw new Error("HISTORY_VERSION_NOT_FOUND");
+    return { version: data as KnowledgePointVersion };
+  }
+  const { data, error } = await client
+    .from("placement_note_versions")
+    .select("id,placement_id,chapter_note_snapshot,content_hash,version_source,created_at")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("HISTORY_VERSION_NOT_FOUND");
+  return { version: data as PlacementNoteVersion };
+}
+
+async function restoreHistory(client: SupabaseClient, kind: HistoryKind, versionId: string) {
+  if (!isUuid(versionId)) throw new Error("HISTORY_PAYLOAD_INVALID");
+  if (kind === "shared") {
+    const { data: version, error: versionError } = await client
+      .from("knowledge_point_versions")
+      .select("id,knowledge_point_id")
+      .eq("id", versionId)
+      .maybeSingle();
+    if (versionError) throw versionError;
+    if (!version) throw new Error("HISTORY_VERSION_NOT_FOUND");
+    const currentSnapshot = await readCurrentPointSnapshot(client, version.knowledge_point_id);
+    const currentHash = await hashJson(currentSnapshot);
+    const { data, error } = await client.rpc("restore_knowledge_point_version", {
+      p_knowledge_point_id: version.knowledge_point_id,
+      p_version_id: versionId,
+      p_current_snapshot: currentSnapshot,
+      p_current_hash: currentHash,
+    });
+    if (error) throw error;
+    return { kind, ...(data as Record<string, unknown>) };
+  }
+
+  const { data: version, error: versionError } = await client
+    .from("placement_note_versions")
+    .select("id,placement_id")
+    .eq("id", versionId)
+    .maybeSingle();
+  if (versionError) throw versionError;
+  if (!version) throw new Error("HISTORY_VERSION_NOT_FOUND");
+  const { data: placement, error: placementError } = await client
+    .from("knowledge_point_placements")
+    .select("id,chapter_note")
+    .eq("id", version.placement_id)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (placementError) throw placementError;
+  if (!placement) throw new Error("PLACEMENT_NOT_FOUND");
+  const currentHash = await hashJson(placement.chapter_note);
+  const { data, error } = await client.rpc("restore_placement_note_version", {
+    p_placement_id: version.placement_id,
+    p_version_id: versionId,
+    p_current_snapshot: placement.chapter_note,
+    p_current_hash: currentHash,
+  });
+  if (error) throw error;
+  return { kind, ...(data as Record<string, unknown>) };
+}
+
+async function readRecycleBin(client: SupabaseClient, kind: "all" | "chapter" | "knowledge_point") {
+  const [chaptersResult, pointsResult, placementsResult] = await Promise.all([
+    client.from("chapters").select("id,title,parent_id,sort_order,deleted_at,deletion_batch_id").order("deleted_at", { ascending: false, nullsFirst: false }),
+    client.from("knowledge_points").select("id,title,status,deleted_at,deletion_batch_id").not("deleted_at", "is", null).order("deleted_at", { ascending: false }),
+    client.from("knowledge_point_placements").select("id,knowledge_point_id,chapter_id,deleted_at,deletion_batch_id,sort_order").order("sort_order", { ascending: true }),
+  ]);
+  const error = chaptersResult.error ?? pointsResult.error ?? placementsResult.error;
+  if (error) throw error;
+
+  const chapters = (chaptersResult.data ?? []) as Array<Chapter & { deletion_batch_id: string | null }>;
+  const points = (pointsResult.data ?? []) as Array<KnowledgePoint & { deletion_batch_id: string | null }>;
+  const placements = (placementsResult.data ?? []) as Array<KnowledgePointPlacement & { deletion_batch_id: string | null }>;
+  const chapterMap = new Map(chapters.map((chapter) => [chapter.id, chapter]));
+  const deletedChapterIds = new Set(chapters.filter((chapter) => chapter.deleted_at !== null).map((chapter) => chapter.id));
+  const activeChapters = chapters.filter((chapter) => chapter.deleted_at === null).map((chapter) => ({ id: chapter.id, title: chapter.title, path: chapterPath(chapters, chapter.id) }));
+  const items: Array<Record<string, unknown>> = [];
+
+  if (kind === "all" || kind === "chapter") {
+    for (const chapter of chapters.filter((item) => item.deleted_at !== null && (!item.parent_id || !deletedChapterIds.has(item.parent_id)))) {
+      items.push({
+        id: chapter.id,
+        item_type: "chapter",
+        title: chapter.title,
+        path: chapterPath(chapters, chapter.parent_id),
+        deleted_at: chapter.deleted_at,
+        deletion_batch_id: chapter.deletion_batch_id,
+        parent_deleted: Boolean(chapter.parent_id && chapterMap.get(chapter.parent_id)?.deleted_at),
+      });
+    }
+  }
+
+  if (kind === "all" || kind === "knowledge_point") {
+    for (const point of points) {
+      const pointPlacements = placements.filter((placement) => placement.knowledge_point_id === point.id);
+      const activePlacementCount = pointPlacements.filter((placement) => placement.deleted_at === null && !deletedChapterIds.has(placement.chapter_id)).length;
+      const firstPlacement = pointPlacements[0];
+      items.push({
+        id: point.id,
+        item_type: "knowledge_point",
+        title: point.title,
+        status: point.status,
+        path: firstPlacement ? chapterPath(chapters, firstPlacement.chapter_id) : "原章节不可用",
+        deleted_at: point.deleted_at,
+        deletion_batch_id: point.deletion_batch_id,
+        placement_count: pointPlacements.length,
+        active_placement_count: activePlacementCount,
+      });
+    }
+  }
+
+  return { items, active_chapters: activeChapters };
+}
+
+async function restoreRecycleItem(client: SupabaseClient, payload: RecycleRestorePayload) {
+  if (!isUuid(payload.id) || (payload.kind !== "chapter" && payload.kind !== "knowledge_point")) throw new Error("RECYCLE_PAYLOAD_INVALID");
+  if (payload.kind === "chapter") {
+    const { data, error } = await client.rpc("restore_chapter_tree", {
+      p_chapter_id: payload.id,
+      p_restore_parent_chain: payload.restore_parents === true,
+    });
+    if (error) throw error;
+    return { item_type: payload.kind, ...(data as Record<string, unknown>) };
+  }
+  const targetChapterId = payload.target_chapter_id === undefined || payload.target_chapter_id === null
+    ? null
+    : payload.target_chapter_id;
+  if (targetChapterId !== null && !isUuid(targetChapterId)) throw new Error("RECYCLE_PAYLOAD_INVALID");
+  const { data, error } = await client.rpc("restore_knowledge_point_with_placements", {
+    p_knowledge_point_id: payload.id,
+    p_target_chapter_id: targetChapterId,
+  });
+  if (error) throw error;
+  return { item_type: payload.kind, ...(data as Record<string, unknown>) };
 }
 
 function validationError(request: Request, message: string) {
@@ -278,6 +571,36 @@ function databaseError(request: Request, error: unknown, fallback: string) {
       error: { code: "TAG_IN_USE", message: "这个标签仍被知识点使用。" },
     });
   }
+  if (message.includes("PARENT_CHAIN_DELETED")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "PARENT_CHAIN_DELETED", message: "上级章节仍在回收站中，需要同时恢复上级目录。" },
+    });
+  }
+  if (message.includes("RESTORE_TARGET_REQUIRED")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "RESTORE_TARGET_REQUIRED", message: "原引用位置均不可用，请选择一个当前章节作为恢复位置。" },
+    });
+  }
+  if (message.includes("HISTORY_VERSION_NOT_FOUND")) {
+    return json(request, 404, {
+      ok: false,
+      error: { code: "HISTORY_VERSION_NOT_FOUND", message: "历史版本不存在或已不属于当前内容。" },
+    });
+  }
+  if (message.includes("HISTORY_SNAPSHOT_INVALID")) {
+    return json(request, 400, {
+      ok: false,
+      error: { code: "HISTORY_SNAPSHOT_INVALID", message: "历史快照格式无效。" },
+    });
+  }
+  if (message.includes("RECYCLE_ITEM_NOT_FOUND")) {
+    return json(request, 404, {
+      ok: false,
+      error: { code: "RECYCLE_ITEM_NOT_FOUND", message: "回收站项目不存在或已经恢复。" },
+    });
+  }
 
   const validationCodes: Record<string, string> = {
     CHAPTER_TITLE_INVALID: "章节名称不能为空，且不能超过 200 个字符。",
@@ -293,6 +616,8 @@ function databaseError(request: Request, error: unknown, fallback: string) {
     TAG_PAYLOAD_INVALID: "标签参数无效。",
     FAVORITE_PAYLOAD_INVALID: "收藏参数无效。",
     PIN_PAYLOAD_INVALID: "置顶参数无效。",
+    HISTORY_PAYLOAD_INVALID: "历史版本参数无效。",
+    RECYCLE_PAYLOAD_INVALID: "回收站参数无效。",
   };
   for (const [code, messageText] of Object.entries(validationCodes)) {
     if (message.includes(code)) {
@@ -418,53 +743,13 @@ async function createChapter(client: SupabaseClient, payload: ChapterPayload) {
   return data as Chapter;
 }
 
-async function descendantsOf(client: SupabaseClient, id: string) {
-  const { data, error } = await client
-    .from("chapters")
-    .select("id,parent_id")
-    .is("deleted_at", null);
-  if (error) throw error;
-
-  const all = (data ?? []) as Array<{ id: string; parent_id: string | null }>;
-  const ids = new Set([id]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const chapter of all) {
-      if (chapter.parent_id && ids.has(chapter.parent_id) && !ids.has(chapter.id)) {
-        ids.add(chapter.id);
-        changed = true;
-      }
-    }
-  }
-  return ids;
-}
-
 async function deleteChapter(client: SupabaseClient, id: string, confirm: boolean) {
-  const chapter = await readChapter(client, id);
-  if (chapter.error) throw chapter.error;
-  if (!chapter.data) throw new Error("CHAPTER_NOT_FOUND");
-
-  const ids = [...await descendantsOf(client, id)];
-  const { data: placements, error: placementError } = await client
-    .from("knowledge_point_placements")
-    .select("id")
-    .in("chapter_id", ids)
-    .is("deleted_at", null);
-  if (placementError) throw placementError;
-
-  const childCount = Math.max(ids.length - 1, 0);
-  const knowledgePointCount = placements?.length ?? 0;
-  if (!confirm && (childCount > 0 || knowledgePointCount > 0)) {
-    return { blocked: true, childCount, knowledgePointCount };
-  }
-
-  const { error } = await client
-    .from("chapters")
-    .update({ deleted_at: new Date().toISOString() })
-    .in("id", ids);
+  const { data, error } = await client.rpc("soft_delete_chapter_tree", {
+    p_chapter_id: id,
+    p_confirm: confirm,
+  });
   if (error) throw error;
-  return { blocked: false, childCount, knowledgePointCount };
+  return data as { blocked: boolean; child_count: number; knowledge_point_count: number; deletion_batch_id?: string };
 }
 
 async function createKnowledgePoint(client: SupabaseClient, payload: KnowledgePointPayload) {
@@ -718,33 +1003,12 @@ async function removePlacement(client: SupabaseClient, placementId: string) {
 
 async function deleteKnowledgePoint(client: SupabaseClient, id: string, confirm: boolean) {
   if (!isUuid(id)) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
-  const { data: placements, error: placementError } = await client
-    .from("knowledge_point_placements")
-    .select("id")
-    .eq("knowledge_point_id", id)
-    .is("deleted_at", null);
-  if (placementError) throw placementError;
-  const placementCount = placements?.length ?? 0;
-  if (!confirm && placementCount > 1) return { blocked: true, placementCount };
-
-  const deletedAt = new Date().toISOString();
-  const { data, error } = await client
-    .from("knowledge_points")
-    .update({ deleted_at: deletedAt })
-    .eq("id", id)
-    .is("deleted_at", null)
-    .select("id")
-    .maybeSingle();
+  const { data, error } = await client.rpc("soft_delete_knowledge_point", {
+    p_knowledge_point_id: id,
+    p_confirm: confirm,
+  });
   if (error) throw error;
-  if (!data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
-
-  const { error: placementUpdateError } = await client
-    .from("knowledge_point_placements")
-    .update({ deleted_at: deletedAt })
-    .eq("knowledge_point_id", id)
-    .is("deleted_at", null);
-  if (placementUpdateError) throw placementUpdateError;
-  return { blocked: false, placementCount };
+  return data as { blocked: boolean; placement_count: number; deletion_batch_id?: string };
 }
 
 async function reorderChapters(client: SupabaseClient, payload: ReorderPayload) {
@@ -1158,6 +1422,81 @@ async function handleNote(request: Request, client: SupabaseClient) {
 }
 
 async function handlePhase2(request: Request, client: SupabaseClient, resource: string) {
+  if (request.method === "GET" && resource === "history") {
+    const url = new URL(request.url);
+    const kind = url.searchParams.get("kind");
+    const id = kind === "shared" ? url.searchParams.get("knowledge_point_id") : url.searchParams.get("placement_id");
+    if (!isHistoryKind(kind) || !isUuid(id)) return validationError(request, "历史版本参数无效。");
+    try {
+      return json(request, 200, { ok: true, kind, ...(await readHistory(client, kind, id)) });
+    } catch (error) {
+      return databaseError(request, error, "历史版本读取失败。");
+    }
+  }
+
+  if (request.method === "GET" && resource === "history_version") {
+    const url = new URL(request.url);
+    const kind = url.searchParams.get("kind");
+    const id = url.searchParams.get("id") ?? url.searchParams.get("version_id");
+    if (!isHistoryKind(kind) || !isUuid(id)) return validationError(request, "历史版本参数无效。");
+    try {
+      return json(request, 200, { ok: true, kind, ...(await readHistoryVersion(client, kind, id)) });
+    } catch (error) {
+      return databaseError(request, error, "历史版本读取失败。");
+    }
+  }
+
+  if (request.method === "POST" && resource === "history") {
+    const payload = await parseBody(request) as HistoryPayload | null;
+    if (!payload || !isHistoryKind(payload.kind)) return validationError(request, "历史版本参数无效。");
+    const id = payload.kind === "shared" ? payload.knowledge_point_id : payload.placement_id;
+    if (!isUuid(id)) return validationError(request, "历史版本对象无效。");
+    try {
+      const version = payload.kind === "shared"
+        ? await createKnowledgePointVersion(client, id, payload.snapshot)
+        : await createPlacementNoteVersion(client, id, payload.snapshot);
+      return json(request, 201, { ok: true, kind: payload.kind, version });
+    } catch (error) {
+      return databaseError(request, error, "历史快照保存失败。");
+    }
+  }
+
+  if (request.method === "POST" && resource === "restore_history") {
+    const payload = await parseBody(request) as HistoryPayload | null;
+    if (!payload || !isHistoryKind(payload.kind) || !isUuid(payload.version_id)) {
+      return validationError(request, "历史版本恢复参数无效。");
+    }
+    try {
+      return json(request, 200, { ok: true, ...(await restoreHistory(client, payload.kind, payload.version_id)) });
+    } catch (error) {
+      return databaseError(request, error, "历史版本恢复失败。");
+    }
+  }
+
+  if (request.method === "GET" && resource === "recycle_bin") {
+    const kind = new URL(request.url).searchParams.get("kind") ?? "all";
+    if (kind !== "all" && kind !== "chapter" && kind !== "knowledge_point") {
+      return validationError(request, "回收站筛选参数无效。");
+    }
+    try {
+      return json(request, 200, { ok: true, ...(await readRecycleBin(client, kind)) });
+    } catch (error) {
+      return databaseError(request, error, "回收站读取失败。");
+    }
+  }
+
+  if (request.method === "POST" && resource === "restore_recycle") {
+    const payload = await parseBody(request) as RecycleRestorePayload | null;
+    if (!payload || !isUuid(payload.id) || (payload.kind !== "chapter" && payload.kind !== "knowledge_point")) {
+      return validationError(request, "回收站恢复参数无效。");
+    }
+    try {
+      return json(request, 200, { ok: true, ...(await restoreRecycleItem(client, payload)) });
+    } catch (error) {
+      return databaseError(request, error, "回收站恢复失败。");
+    }
+  }
+
   if (request.method === "GET" && resource === "search") {
     const url = new URL(request.url);
     const query = url.searchParams.get("q") ?? "";
@@ -1423,9 +1762,9 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
         ok: false,
         error: {
           code: "CHAPTER_NOT_EMPTY",
-          message: `此章节包含 ${result.childCount} 个子章节和 ${result.knowledgePointCount} 个知识点。`,
-          child_count: result.childCount,
-          knowledge_point_count: result.knowledgePointCount,
+          message: `此章节包含 ${result.child_count} 个子章节和 ${result.knowledge_point_count} 个知识点。`,
+          child_count: result.child_count,
+          knowledge_point_count: result.knowledge_point_count,
         },
       });
     }
@@ -1441,12 +1780,12 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
         ok: false,
         error: {
           code: "KNOWLEDGE_POINT_SHARED",
-          message: `该知识点目前存在于 ${result.placementCount} 个章节中。请确认彻底删除，或只移除当前章节引用。`,
-          placement_count: result.placementCount,
+          message: `该知识点目前存在于 ${result.placement_count} 个章节中。请确认彻底删除，或只移除当前章节引用。`,
+          placement_count: result.placement_count,
         },
       });
     }
-    return json(request, 200, { ok: true, deleted: true, placement_count: result.placementCount });
+    return json(request, 200, { ok: true, deleted: true, placement_count: result.placement_count });
   }
 
   return json(request, 404, {
