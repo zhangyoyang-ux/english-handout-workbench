@@ -117,8 +117,14 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
 .status-select { padding: 9px 30px 9px 10px; border: 1px solid #dededb; border-radius: 10px; background: #fff; color: #444449; font-size: 13px; }
 .content-loading--compact { padding: 34px 12px; text-align: left; }
 .content-edit-stack, .content-read-stack { display: grid; gap: 18px; margin-top: 26px; }
+.content-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 2px 0; }
+.content-group-heading h3 { margin: 0; color: #303035; font-size: 18px; letter-spacing: -.03em; }
+.content-group-heading span { display: block; margin-top: 4px; color: #99999e; font-size: 12px; }
+.content-group-heading--chapter { margin-top: 7px; }
+.content-group-heading--read { margin-top: 2px; }
 .content-section { min-width: 0; border: 1px solid #ededeb; border-radius: 17px; background: #fff; overflow: hidden; }
 .content-section--inspiration { background: #fffdf7; }
+.content-section--chapter-note { background: #fafafa; }
 .content-section__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 18px 0; }
 .content-section__heading h3, .content-section--read > h3 { margin: 0; color: #303035; font-size: 16px; letter-spacing: -.02em; }
 .content-section__heading span { color: #aaaab0; font-size: 11px; }
@@ -146,6 +152,24 @@ h1 { margin-bottom: 0; font-size: clamp(30px,4vw,46px); font-weight: 700; letter
 .no-content-state p { margin: 0; font-size: 13px; }
 .point-navigation { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 28px; padding-top: 18px; border-top: 1px solid #f0f0ee; }
 .point-navigation .secondary-button, .point-navigation .quiet-button { min-width: 82px; }
+.reference-picker { margin: -6px 0 22px; padding: 16px; border: 1px solid #e8e8e5; border-radius: 15px; background: #fbfbfa; }
+.reference-picker__header { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-bottom: 12px; }
+.reference-picker__header strong { display: block; color: #303035; font-size: 14px; }
+.reference-picker__header span { display: block; margin-top: 4px; color: #96969b; font-size: 12px; }
+.reference-picker__tree { display: grid; gap: 2px; max-height: 310px; overflow: auto; padding: 6px; border-radius: 10px; background: #fff; }
+.chapter-choice-row { display: flex; align-items: center; min-height: 34px; padding-left: calc(var(--tree-depth, 0) * 16px); border-radius: 8px; }
+.chapter-choice-row:hover { background: #f5f5f3; }
+.chapter-choice-button { display: flex; align-items: center; justify-content: space-between; min-width: 0; flex: 1; gap: 8px; padding: 7px 8px 7px 2px; border: 0; background: transparent; color: #45454a; text-align: left; font-size: 13px; }
+.chapter-choice-button:hover { color: #1c1c1e; }
+.chapter-choice-button em { flex: 0 0 auto; color: #a0a0a4; font-size: 11px; font-style: normal; }
+.chapter-choice-button--existing { color: #9b6969; }
+.placements-panel { margin: 6px 0 22px; padding: 15px 17px; border-radius: 15px; background: #f7f7f5; }
+.placements-panel__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.placements-panel__heading h3 { margin: 0; color: #444449; font-size: 14px; }
+.placements-panel__heading span { color: #a0a0a4; font-size: 11px; }
+.placement-links { display: grid; gap: 3px; }
+.placement-link { width: fit-content; max-width: 100%; padding: 5px 7px; border: 0; border-radius: 7px; background: transparent; color: #69696e; text-align: left; font-size: 12px; }
+.placement-link:hover, .placement-link--current { background: #fff; color: #1c1c1e; }
 
 @media (max-width: 820px) {
   .app-shell { padding: 14px 10px; }

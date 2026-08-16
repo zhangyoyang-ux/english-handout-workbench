@@ -49,7 +49,9 @@ type KnowledgePointPlacement = {
   knowledge_point_id: string;
   chapter_id: string;
   sort_order: number;
+  chapter_note: RichDocument;
   created_at: string;
+  deleted_at: string | null;
 };
 
 type NotePayload = {
@@ -70,6 +72,7 @@ type KnowledgePointPayload = {
   id?: unknown;
   title?: unknown;
   status?: unknown;
+  knowledge_point_id?: unknown;
   chapter_id?: unknown;
   placement_id?: unknown;
   explanation?: unknown;
@@ -204,6 +207,18 @@ function databaseError(request: Request, error: unknown, fallback: string) {
       error: { code: "INVALID_KNOWLEDGE_POINT_ORDER", message: "知识点排序数据无效。" },
     });
   }
+  if (message.includes("PLACEMENT_DUPLICATE")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "PLACEMENT_DUPLICATE", message: "该知识点已经存在于此章节。" },
+    });
+  }
+  if (message.includes("KNOWLEDGE_POINT_SHARED")) {
+    return json(request, 409, {
+      ok: false,
+      error: { code: "KNOWLEDGE_POINT_SHARED", message: "该知识点仍被其他章节引用。" },
+    });
+  }
 
   const validationCodes: Record<string, string> = {
     CHAPTER_TITLE_INVALID: "章节名称不能为空，且不能超过 200 个字符。",
@@ -213,6 +228,7 @@ function databaseError(request: Request, error: unknown, fallback: string) {
     KNOWLEDGE_POINT_STATUS_INVALID: "知识点状态无效。",
     KNOWLEDGE_POINT_CREATE_ERROR: "知识点创建失败。",
     PLACEMENT_NOT_FOUND: "知识点位置不存在。",
+    CHAPTER_NOTE_INVALID: "本章补充内容格式无效。",
     CONTENT_PAYLOAD_INVALID: "知识点内容格式无效。",
   };
   for (const [code, messageText] of Object.entries(validationCodes)) {
@@ -261,7 +277,8 @@ async function readTree(client: SupabaseClient) {
       .order("created_at", { ascending: true }),
     client
       .from("knowledge_point_placements")
-      .select("id,knowledge_point_id,chapter_id,sort_order,created_at")
+      .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+      .is("deleted_at", null)
       .order("sort_order", { ascending: true })
       .order("created_at", { ascending: true }),
   ]);
@@ -286,6 +303,15 @@ async function readChapter(client: SupabaseClient, id: string) {
   return client
     .from("chapters")
     .select("id,title,parent_id,sort_order,content,created_at,updated_at,deleted_at")
+    .eq("id", id)
+    .is("deleted_at", null)
+    .maybeSingle();
+}
+
+async function readKnowledgePoint(client: SupabaseClient, id: string) {
+  return client
+    .from("knowledge_points")
+    .select("id,title,status,created_at,updated_at,deleted_at")
     .eq("id", id)
     .is("deleted_at", null)
     .maybeSingle();
@@ -360,7 +386,8 @@ async function deleteChapter(client: SupabaseClient, id: string, confirm: boolea
   const { data: placements, error: placementError } = await client
     .from("knowledge_point_placements")
     .select("id")
-    .in("chapter_id", ids);
+    .in("chapter_id", ids)
+    .is("deleted_at", null);
   if (placementError) throw placementError;
 
   const childCount = Math.max(ids.length - 1, 0);
@@ -402,8 +429,9 @@ async function createKnowledgePoint(client: SupabaseClient, payload: KnowledgePo
 
   const { data: placement, error: placementError } = await client
     .from("knowledge_point_placements")
-    .select("id,knowledge_point_id,chapter_id,sort_order,created_at")
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
     .eq("id", result.placement_id)
+    .is("deleted_at", null)
     .single();
   if (placementError) throw placementError;
 
@@ -498,8 +526,9 @@ async function moveKnowledgePoint(client: SupabaseClient, placementId: string, c
 
   const { data: placement, error: placementError } = await client
     .from("knowledge_point_placements")
-    .select("id,knowledge_point_id,chapter_id,sort_order,created_at")
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
     .eq("id", placementId)
+    .is("deleted_at", null)
     .maybeSingle();
   if (placementError) throw placementError;
   if (!placement) throw new Error("PLACEMENT_NOT_FOUND");
@@ -508,6 +537,7 @@ async function moveKnowledgePoint(client: SupabaseClient, placementId: string, c
     .from("knowledge_point_placements")
     .select("sort_order")
     .eq("chapter_id", chapterId)
+    .is("deleted_at", null)
     .order("sort_order", { ascending: false })
     .limit(1);
   if (sortError) throw sortError;
@@ -516,10 +546,142 @@ async function moveKnowledgePoint(client: SupabaseClient, placementId: string, c
     .from("knowledge_point_placements")
     .update({ chapter_id: chapterId, sort_order: (maxSort?.[0]?.sort_order ?? -1) + 1 })
     .eq("id", placementId)
-    .select("id,knowledge_point_id,chapter_id,sort_order,created_at")
+    .is("deleted_at", null)
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
     .single();
   if (error) throw error;
   return data as KnowledgePointPlacement;
+}
+
+async function readKnowledgePointPlacements(client: SupabaseClient, knowledgePointId: string) {
+  if (!isUuid(knowledgePointId)) throw new Error("PLACEMENT_NOT_FOUND");
+
+  const { data: point, error: pointError } = await client
+    .from("knowledge_points")
+    .select("id,title,status")
+    .eq("id", knowledgePointId)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (pointError) throw pointError;
+  if (!point) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+
+  const { data, error } = await client
+    .from("knowledge_point_placements")
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+    .eq("knowledge_point_id", knowledgePointId)
+    .is("deleted_at", null)
+    .order("sort_order", { ascending: true });
+  if (error) throw error;
+  return { knowledge_point: point as Pick<KnowledgePoint, "id" | "title" | "status">, placements: (data ?? []) as KnowledgePointPlacement[] };
+}
+
+async function nextPlacementSortOrder(client: SupabaseClient, chapterId: string) {
+  const { data, error } = await client
+    .from("knowledge_point_placements")
+    .select("sort_order")
+    .eq("chapter_id", chapterId)
+    .is("deleted_at", null)
+    .order("sort_order", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return (data?.[0]?.sort_order ?? -1) + 1;
+}
+
+async function createPlacement(client: SupabaseClient, knowledgePointId: string, chapterId: string) {
+  if (!isUuid(knowledgePointId) || !isUuid(chapterId)) throw new Error("PLACEMENT_NOT_FOUND");
+
+  const [point, chapter] = await Promise.all([readKnowledgePoint(client, knowledgePointId), readChapter(client, chapterId)]);
+  if (point.error) throw point.error;
+  if (chapter.error) throw chapter.error;
+  if (!point.data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+  if (!chapter.data) throw new Error("CHAPTER_NOT_FOUND");
+
+  const { data: existing, error: existingError } = await client
+    .from("knowledge_point_placements")
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+    .eq("knowledge_point_id", knowledgePointId)
+    .eq("chapter_id", chapterId)
+    .maybeSingle();
+  if (existingError) throw existingError;
+  if (existing && existing.deleted_at === null) throw new Error("PLACEMENT_DUPLICATE");
+
+  if (existing) {
+    const { data, error } = await client
+      .from("knowledge_point_placements")
+      .update({ deleted_at: null, sort_order: await nextPlacementSortOrder(client, chapterId) })
+      .eq("id", existing.id)
+      .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+      .single();
+    if (error) throw error;
+    return { placement: data as KnowledgePointPlacement, restored: true };
+  }
+
+  const { data, error } = await client
+    .from("knowledge_point_placements")
+    .insert({ knowledge_point_id: knowledgePointId, chapter_id: chapterId, sort_order: await nextPlacementSortOrder(client, chapterId) })
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+    .single();
+  if (error) throw error;
+  return { placement: data as KnowledgePointPlacement, restored: false };
+}
+
+async function savePlacementNote(client: SupabaseClient, placementId: string, chapterNote: unknown) {
+  if (!isUuid(placementId) || !isRichDocument(chapterNote)) throw new Error("CHAPTER_NOTE_INVALID");
+  const { data, error } = await client
+    .from("knowledge_point_placements")
+    .update({ chapter_note: chapterNote })
+    .eq("id", placementId)
+    .is("deleted_at", null)
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("PLACEMENT_NOT_FOUND");
+  return data as KnowledgePointPlacement;
+}
+
+async function removePlacement(client: SupabaseClient, placementId: string) {
+  if (!isUuid(placementId)) throw new Error("PLACEMENT_NOT_FOUND");
+  const { data, error } = await client
+    .from("knowledge_point_placements")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", placementId)
+    .is("deleted_at", null)
+    .select("id,knowledge_point_id,chapter_id,sort_order,chapter_note,created_at,deleted_at")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("PLACEMENT_NOT_FOUND");
+  return data as KnowledgePointPlacement;
+}
+
+async function deleteKnowledgePoint(client: SupabaseClient, id: string, confirm: boolean) {
+  if (!isUuid(id)) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+  const { data: placements, error: placementError } = await client
+    .from("knowledge_point_placements")
+    .select("id")
+    .eq("knowledge_point_id", id)
+    .is("deleted_at", null);
+  if (placementError) throw placementError;
+  const placementCount = placements?.length ?? 0;
+  if (!confirm && placementCount > 1) return { blocked: true, placementCount };
+
+  const deletedAt = new Date().toISOString();
+  const { data, error } = await client
+    .from("knowledge_points")
+    .update({ deleted_at: deletedAt })
+    .eq("id", id)
+    .is("deleted_at", null)
+    .select("id")
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("KNOWLEDGE_POINT_NOT_FOUND");
+
+  const { error: placementUpdateError } = await client
+    .from("knowledge_point_placements")
+    .update({ deleted_at: deletedAt })
+    .eq("knowledge_point_id", id)
+    .is("deleted_at", null);
+  if (placementUpdateError) throw placementUpdateError;
+  return { blocked: false, placementCount };
 }
 
 async function reorderChapters(client: SupabaseClient, payload: ReorderPayload) {
@@ -612,6 +774,12 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
     });
   }
 
+  if (request.method === "GET" && resource === "placements") {
+    const id = new URL(request.url).searchParams.get("id");
+    if (!isUuid(id)) return validationError(request, "知识点引用参数无效。");
+    return json(request, 200, { ok: true, ...(await readKnowledgePointPlacements(client, id)) });
+  }
+
   if (request.method === "POST" && resource === "chapter") {
     const payload = await parseBody(request) as ChapterPayload | null;
     if (!payload) return validationError(request, "请求内容不是有效 JSON。");
@@ -622,6 +790,21 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
     const payload = await parseBody(request) as KnowledgePointPayload | null;
     if (!payload) return validationError(request, "请求内容不是有效 JSON。");
     return json(request, 201, { ok: true, ...(await createKnowledgePoint(client, payload)) });
+  }
+
+  if (request.method === "POST" && resource === "placement") {
+    const payload = await parseBody(request) as KnowledgePointPayload | null;
+    if (!payload || !isUuid(payload.knowledge_point_id) || !isUuid(payload.chapter_id)) {
+      return validationError(request, "知识点引用参数无效。");
+    }
+    try {
+      return json(request, 201, {
+        ok: true,
+        ...(await createPlacement(client, payload.knowledge_point_id, payload.chapter_id)),
+      });
+    } catch (error) {
+      return databaseError(request, error, "添加引用失败。");
+    }
   }
 
   if (request.method === "PATCH" && resource === "chapters") {
@@ -683,11 +866,32 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
   if (request.method === "PATCH" && resource === "placement") {
     const payload = await parseBody(request) as KnowledgePointPayload | null;
     const placementId = new URL(request.url).searchParams.get("id") ?? payload?.placement_id;
-    if (!payload || !isUuid(placementId) || !isUuid(payload.chapter_id)) return validationError(request, "知识点移动参数无效。");
+    if (!payload || !isUuid(placementId)) return validationError(request, "知识点位置参数无效。");
     try {
-      return json(request, 200, { ok: true, placement: await moveKnowledgePoint(client, placementId, payload.chapter_id) });
+      if (payload.chapter_id !== undefined) {
+        if (!isUuid(payload.chapter_id)) return validationError(request, "知识点移动参数无效。");
+        const moved = await moveKnowledgePoint(client, placementId, payload.chapter_id);
+        const placement = payload.chapter_note !== undefined
+          ? await savePlacementNote(client, placementId, payload.chapter_note)
+          : moved;
+        return json(request, 200, { ok: true, placement });
+      }
+      if (payload.chapter_note !== undefined) {
+        return json(request, 200, { ok: true, placement: await savePlacementNote(client, placementId, payload.chapter_note) });
+      }
+      return validationError(request, "没有需要更新的知识点位置内容。");
     } catch (error) {
       return databaseError(request, error, "知识点移动失败。");
+    }
+  }
+
+  if (request.method === "DELETE" && resource === "placement") {
+    const id = new URL(request.url).searchParams.get("id");
+    if (!isUuid(id)) return validationError(request, "知识点位置 ID 无效。");
+    try {
+      return json(request, 200, { ok: true, placement: await removePlacement(client, id) });
+    } catch (error) {
+      return databaseError(request, error, "移除当前引用失败。");
     }
   }
 
@@ -713,16 +917,18 @@ async function handlePhase2(request: Request, client: SupabaseClient, resource: 
   if (request.method === "DELETE" && resource === "knowledge_point") {
     const id = new URL(request.url).searchParams.get("id");
     if (!isUuid(id)) return validationError(request, "知识点 ID 无效。");
-    const { data, error } = await client
-      .from("knowledge_points")
-      .update({ deleted_at: new Date().toISOString() })
-      .eq("id", id)
-      .is("deleted_at", null)
-      .select("id")
-      .maybeSingle();
-    if (error) return databaseError(request, error, "知识点删除失败。");
-    if (!data) return json(request, 404, { ok: false, error: { code: "KNOWLEDGE_POINT_NOT_FOUND", message: "知识点不存在或已删除。" } });
-    return json(request, 200, { ok: true, deleted: true });
+    const result = await deleteKnowledgePoint(client, id, new URL(request.url).searchParams.get("confirm") === "true");
+    if (result.blocked) {
+      return json(request, 409, {
+        ok: false,
+        error: {
+          code: "KNOWLEDGE_POINT_SHARED",
+          message: `该知识点目前存在于 ${result.placementCount} 个章节中。请确认彻底删除，或只移除当前章节引用。`,
+          placement_count: result.placementCount,
+        },
+      });
+    }
+    return json(request, 200, { ok: true, deleted: true, placement_count: result.placementCount });
   }
 
   return json(request, 404, {
