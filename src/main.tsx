@@ -1,4 +1,4 @@
-import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type ReactNode } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent, type DragEvent, type ReactNode } from "react";
 import { EditorContent, useEditor, type Editor } from "@tiptap/react";
 import type { JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
@@ -137,12 +137,49 @@ type RecycleItem = {
   active_placement_count?: number;
 };
 
+type BackupTableName =
+  | "stage1_notes"
+  | "workbench_initialization"
+  | "chapters"
+  | "knowledge_points"
+  | "knowledge_point_contents"
+  | "knowledge_point_placements"
+  | "tags"
+  | "knowledge_point_tags"
+  | "favorite_items"
+  | "pinned_items"
+  | "knowledge_point_versions"
+  | "placement_note_versions";
+type FullBackupData = Record<BackupTableName, Array<Record<string, unknown>>>;
+type FullBackup = {
+  manifest: {
+    app: "悠扬讲义";
+    backup_format_version: 1;
+    schema_version: "0008";
+    migration_versions: string[];
+    created_at: string;
+    data_checksum: string;
+    checksum_algorithm: "SHA-256";
+    counts: Record<BackupTableName, number>;
+  };
+  data: FullBackupData;
+};
+type SaveFilePickerWindow = Window & {
+  showSaveFilePicker?: (options: {
+    suggestedName: string;
+    types?: Array<{ description: string; accept: Record<string, string[]> }>;
+  }) => Promise<{ createWritable: () => Promise<{ write: (data: string) => Promise<void>; close: () => Promise<void> }> }>;
+};
+
 const EMPTY_TREE: TreeData = { chapters: [], knowledge_points: [], knowledge_point_placements: [] };
 const AUTOSAVE_DELAY = 800;
 const EXPANDED_KEY = "english-handout-workbench:phase2:expanded";
 const NOTES_FUNCTION_URL = import.meta.env.VITE_NOTES_FUNCTION_URL ?? "https://dtcrxkdjzrklrhtxosxn.supabase.co/functions/v1/notes";
 const CONTENT_DRAFT_PREFIX = "english-handout-workbench:phase3:content:";
 const CHAPTER_NOTE_DRAFT_PREFIX = "english-handout-workbench:phase4:chapter-note:";
+const LAST_FULL_BACKUP_KEY = "last_full_backup_at";
+const MAX_BACKUP_BYTES = 25_000_000;
+const BACKUP_TABLES: BackupTableName[] = ["stage1_notes", "workbench_initialization", "chapters", "knowledge_points", "knowledge_point_contents", "knowledge_point_placements", "tags", "knowledge_point_tags", "favorite_items", "pinned_items", "knowledge_point_versions", "placement_note_versions"];
 const CONTENT_SECTIONS: ContentSection[] = ["explanation", "exercises", "supplement", "inspiration"];
 const SECTION_LABELS: Record<ContentSection, string> = {
   explanation: "知识讲解",
@@ -196,6 +233,40 @@ function documentHasText(document: RichDocument): boolean {
   return Array.isArray(document.content) && document.content.some((node) => documentHasText(node));
 }
 function documentsEqual(left: RichDocument, right: RichDocument) { return JSON.stringify(left) === JSON.stringify(right); }
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (value && typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).sort().reduce<Record<string, unknown>>((result, key) => {
+      result[key] = stableJsonValue((value as Record<string, unknown>)[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+function stableJsonStringify(value: unknown) { return JSON.stringify(stableJsonValue(value)); }
+async function hashCanonicalJson(value: unknown) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJsonStringify(value)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function hasOnlyKeys(value: unknown, keys: string[]) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).every((key) => keys.includes(key)));
+}
+function backupSummary(backup: FullBackup) {
+  const counts = backup.manifest.counts;
+  const deletedChapters = backup.data.chapters.filter((row) => row.deleted_at !== null).length;
+  const deletedPoints = backup.data.knowledge_points.filter((row) => row.deleted_at !== null).length;
+  return [
+    `${counts.chapters} 个章节`,
+    `${counts.knowledge_points} 个知识点`,
+    `${counts.knowledge_point_placements} 个引用位置`,
+    `${counts.tags} 个标签`,
+    `${counts.knowledge_point_versions + counts.placement_note_versions} 个历史版本`,
+    `${deletedChapters + deletedPoints} 个回收站项目`,
+  ];
+}
+function formatBackupTime(value: string) {
+  try { return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); } catch { return value; }
+}
 
 function endpoint(resource: string, params: Record<string, string> = {}) {
   const url = new URL(NOTES_FUNCTION_URL);
@@ -215,6 +286,64 @@ async function requestJson<T extends ApiResponse>(url: string, init?: RequestIni
   try { body = await response.json() as T; } catch { throw new ApiRequestError(`服务器返回异常（${response.status}）。`, "INVALID_RESPONSE"); }
   if (!response.ok || !body.ok) throw new ApiRequestError(body.error?.message ?? `请求失败（${response.status}）。`, body.error?.code, body.error);
   return body;
+}
+
+async function validateBackupFile(value: unknown): Promise<FullBackup> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("这不是有效的悠扬讲义完整备份文件。");
+  const backup = value as Partial<FullBackup>;
+  const manifest = backup.manifest;
+  const data = backup.data;
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || !data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("这不是有效的悠扬讲义完整备份文件。");
+  }
+  const manifestRecord = manifest as Record<string, unknown>;
+  const expectedManifestKeys = ["app", "backup_format_version", "schema_version", "migration_versions", "created_at", "data_checksum", "checksum_algorithm", "counts"];
+  if (!hasOnlyKeys(manifest, expectedManifestKeys) || manifestRecord.app !== "悠扬讲义" || manifestRecord.backup_format_version !== 1 || manifestRecord.checksum_algorithm !== "SHA-256" || typeof manifestRecord.schema_version !== "string" || !Array.isArray(manifestRecord.migration_versions) || typeof manifestRecord.created_at !== "string" || typeof manifestRecord.data_checksum !== "string" || !manifestRecord.counts || typeof manifestRecord.counts !== "object" || Array.isArray(manifestRecord.counts)) {
+    throw new Error("这不是有效的悠扬讲义完整备份文件。");
+  }
+  if (manifestRecord.schema_version !== "0008") throw new Error("该备份由更新版本的悠扬讲义生成，请先升级系统后再恢复。");
+  if (!hasOnlyKeys(data, BACKUP_TABLES)) throw new Error("备份文件缺少必要的数据区域。");
+  const dataRecord = data as Record<string, unknown>;
+  const counts = manifestRecord.counts as Record<string, unknown>;
+  if (!hasOnlyKeys(counts, BACKUP_TABLES) || BACKUP_TABLES.some((table) => !Array.isArray(dataRecord[table]) || counts[table] !== (dataRecord[table] as unknown[]).length)) {
+    throw new Error("备份文件数量统计与数据不一致。");
+  }
+  if (new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_BACKUP_BYTES) throw new Error("备份文件过大，无法安全处理。");
+  if (await hashCanonicalJson(data) !== manifestRecord.data_checksum) throw new Error("备份文件完整性校验失败。");
+  return backup as FullBackup;
+}
+
+function backupFilename(prefix: string) {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${prefix}_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}.json`;
+}
+
+async function saveJsonFile(filename: string, text: string) {
+  const pickerWindow = window as SaveFilePickerWindow;
+  if (pickerWindow.showSaveFilePicker) {
+    try {
+      const handle = await pickerWindow.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "悠扬讲义完整备份 JSON", accept: { "application/json": [".json"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      return;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw new Error("BACKUP_SAVE_CANCELLED");
+    }
+  }
+  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function readExpandedIds() {
@@ -340,6 +469,15 @@ function App() {
   const [exportSelectedItems, setExportSelectedItems] = useState<ExportSelection[]>([]);
   const [exportExpandedChapterIds, setExportExpandedChapterIds] = useState<Set<string>>(new Set());
   const [exportBusy, setExportBusy] = useState(false);
+  const [dataSecurityOpen, setDataSecurityOpen] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupError, setBackupError] = useState("");
+  const [backupNotice, setBackupNotice] = useState("");
+  const [backupCandidate, setBackupCandidate] = useState<FullBackup | null>(null);
+  const [backupPreflight, setBackupPreflight] = useState<Record<string, unknown> | null>(null);
+  const [backupConfirmOpen, setBackupConfirmOpen] = useState(false);
+  const [backupRestoring, setBackupRestoring] = useState(false);
+  const [lastFullBackupAt, setLastFullBackupAt] = useState(() => localStorage.getItem(LAST_FULL_BACKUP_KEY) ?? "");
   const loadedChapterIdRef = useRef<string | null>(null);
   const pendingContentFieldsRef = useRef<Set<ContentSection>>(new Set());
   const contentVersionRef = useRef(0);
@@ -456,6 +594,81 @@ function App() {
   }, []);
 
   const refreshFastAccess = useCallback(() => { void loadFastAccess(); }, [loadFastAccess]);
+
+  const openDataSecurity = () => {
+    setDataSecurityOpen(true);
+    setBackupError("");
+    setBackupNotice("");
+  };
+
+  const exportFullBackup = async () => {
+    setBackupBusy(true); setBackupError(""); setBackupNotice("");
+    try {
+      const result = await requestJson<{ ok: true; backup: FullBackup }>(endpoint("backup"));
+      const text = JSON.stringify(result.backup, null, 2);
+      await saveJsonFile(backupFilename("悠扬讲义备份"), text);
+      const savedAt = new Date().toISOString();
+      localStorage.setItem(LAST_FULL_BACKUP_KEY, savedAt);
+      setLastFullBackupAt(savedAt);
+      setBackupNotice("完整备份已生成并保存。请妥善保管这个 JSON 文件。");
+    } catch (error) {
+      setBackupError(error instanceof Error && error.message === "BACKUP_SAVE_CANCELLED" ? "已取消保存，备份文件尚未生成。" : error instanceof Error ? error.message : "完整备份生成失败，请重试。");
+    } finally { setBackupBusy(false); }
+  };
+
+  const handleBackupFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    setBackupCandidate(null); setBackupPreflight(null); setBackupError(""); setBackupNotice("");
+    if (!file) return;
+    if (file.size > MAX_BACKUP_BYTES) { setBackupError("备份文件过大，无法安全处理。"); return; }
+    setBackupBusy(true);
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const backup = await validateBackupFile(parsed);
+      const result = await requestJson<{ ok: true; preflight: Record<string, unknown> }>(endpoint("backup_preflight"), { method: "POST", body: JSON.stringify({ backup }) });
+      setBackupCandidate(backup);
+      setBackupPreflight(result.preflight);
+      setBackupNotice("备份有效，数据库预检通过。请确认后再恢复。");
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "备份校验失败，请选择有效的悠扬讲义备份文件。");
+    } finally { setBackupBusy(false); }
+  };
+
+  const prepareBackupRestore = async () => {
+    if (!backupCandidate || !backupPreflight) return;
+    setBackupBusy(true); setBackupError(""); setBackupNotice("");
+    try {
+      const result = await requestJson<{ ok: true; backup: FullBackup }>(endpoint("backup"));
+      await saveJsonFile(backupFilename("悠扬讲义_恢复前安全备份"), JSON.stringify(result.backup, null, 2));
+      setBackupConfirmOpen(true);
+    } catch (error) {
+      setBackupError(error instanceof Error && error.message === "BACKUP_SAVE_CANCELLED" ? "未完成恢复：请先保存恢复前安全备份。" : error instanceof Error ? error.message : "恢复前安全备份生成失败，未执行恢复。");
+    } finally { setBackupBusy(false); }
+  };
+
+  const clearRestoreDrafts = () => {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (key && (key.startsWith(CONTENT_DRAFT_PREFIX) || key.startsWith(CHAPTER_NOTE_DRAFT_PREFIX))) localStorage.removeItem(key);
+    }
+  };
+
+  const executeBackupRestore = async () => {
+    if (!backupCandidate) return;
+    setBackupRestoring(true); setBackupError("");
+    try {
+      const result = await requestJson<{ ok: true; restore: Record<string, unknown>; post_check: { passed: boolean } }>(endpoint("backup_restore"), { method: "POST", body: JSON.stringify({ backup: backupCandidate }) });
+      if (!result.post_check?.passed) throw new Error("恢复后的数据校验未通过。");
+      clearRestoreDrafts();
+      await loadTree();
+      await loadFastAccess();
+      setBackupConfirmOpen(false); setBackupCandidate(null); setBackupPreflight(null);
+      setBackupNotice("恢复完成 ✓ 目录、知识点、引用关系与历史数据已重新读取。");
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : "恢复失败，数据库已保持恢复前状态。");
+    } finally { setBackupRestoring(false); }
+  };
 
   const refreshPointContent = useCallback(async (pointId: string) => {
     const result = await requestJson<{ ok: true; knowledge_point: KnowledgePoint; content: KnowledgePointContent | null }>(endpoint("content", { id: pointId }));
@@ -1181,11 +1394,27 @@ function App() {
     {!searchQuery.trim() ? <p className="mobile-search-empty">输入关键词开始搜索。</p> : searchLoading ? <p className="mobile-loading">正在搜索……</p> : searchError ? <p className="mobile-search-error">{searchError}</p> : searchResults.length === 0 ? <p className="mobile-search-empty">没有搜索结果，换一个关键词试试。</p> : <div className="mobile-search-results">{searchResults.map((result) => <button type="button" className="mobile-search-result" key={result.id} onClick={() => openSearchResult(result)}><strong>{result.title}</strong><span>{result.context?.path ?? result.paths[0] ?? "知识点"}</span><small>{result.match_types.map(matchTypeLabel).join(" · ")}{result.tags.length > 0 ? ` · ${result.tags.map((tag) => tag.name).join(" · ")}` : ""}</small>{result.context?.text && <p>{result.context.text}</p>}</button>)}</div>}
   </div>;
 
+  const renderDataSecurity = () => {
+    if (!dataSecurityOpen) return null;
+    return <div className="backup-overlay" role="presentation" onClick={() => { if (!backupBusy && !backupRestoring && !backupConfirmOpen) setDataSecurityOpen(false); }}>
+      <section className="backup-surface" role="dialog" aria-modal="true" aria-labelledby="backup-title" onClick={(event) => event.stopPropagation()}>
+        <header className="backup-surface__header"><div><p className="content-kicker">低频安全工具</p><h2 id="backup-title">数据与安全</h2></div><button type="button" className="quiet-button" onClick={() => setDataSecurityOpen(false)} disabled={backupBusy || backupRestoring}>关闭</button></header>
+        <p className="backup-surface__intro">完整备份会包含章节、知识点、引用关系、标签、历史版本和回收站数据，不包含任何密钥或浏览器临时草稿。</p>
+        {backupError && <div className="backup-alert backup-alert--error" role="alert">{backupError}</div>}
+        {backupNotice && <div className="backup-alert backup-alert--success" role="status">{backupNotice}</div>}
+        <section className="backup-section"><div><h3>完整备份</h3><p>将悠扬讲义的全部业务数据导出为一个 UTF-8 JSON 文件。</p>{lastFullBackupAt && <small>上次完整备份：{formatBackupTime(lastFullBackupAt)}</small>}</div><button type="button" className="primary-button" disabled={backupBusy || backupRestoring} onClick={() => void exportFullBackup()}>{backupBusy ? "正在处理……" : "导出完整备份"}</button></section>
+        <section className="backup-section"><div><h3>从备份恢复</h3><p>选择备份文件后，系统会先校验并预检，确认后才会写入数据库。</p></div><label className="secondary-button backup-file-button"><input type="file" accept=".json,application/json" onChange={(event) => void handleBackupFile(event)} disabled={backupBusy || backupRestoring} />选择备份文件</label></section>
+        {backupCandidate && backupPreflight && <section className="backup-summary"><div className="backup-summary__heading"><div><span className="backup-summary__status">✓ 备份有效</span><h3>恢复摘要</h3><p>备份时间：{formatBackupTime(backupCandidate.manifest.created_at)}</p></div><span className="backup-summary__checksum">完整性校验通过</span></div><ul>{backupSummary(backupCandidate).map((item) => <li key={item}>{item}</li>)}</ul><button type="button" className="secondary-button" disabled={backupBusy || backupRestoring} onClick={() => void prepareBackupRestore()}>{backupBusy ? "正在生成安全备份……" : "恢复此备份"}</button></section>}
+        {backupConfirmOpen && backupCandidate && <div className="backup-confirm" role="dialog" aria-modal="true" aria-labelledby="backup-confirm-title"><h3 id="backup-confirm-title">确认恢复完整备份？</h3><p>即将把悠扬讲义恢复到 {formatBackupTime(backupCandidate.manifest.created_at)} 的状态。</p><p>当前数据已先生成一份“恢复前安全备份”。如果恢复结果不符合预期，可以再次恢复回来。</p><div className="backup-confirm__actions"><button type="button" className="quiet-button" disabled={backupRestoring} onClick={() => setBackupConfirmOpen(false)}>取消</button><button type="button" className="danger-button" disabled={backupRestoring} onClick={() => void executeBackupRestore()}>{backupRestoring ? "正在恢复……" : "确认恢复"}</button></div></div>}
+      </section>
+    </div>;
+  };
+
   const renderMobileSheet = () => {
     if (!mobileSheet) return null;
     const sheetTitle = mobileSheet === "menu" ? "更多" : mobileSheet === "new" ? "新建" : mobileSheet === "chapter" ? "章节操作" : mobileSheet === "point" ? "知识点操作" : mobileSheet === "placements" ? "所在章节" : "筛选";
     return <div className="mobile-sheet-backdrop" role="presentation" onClick={() => setMobileSheet(null)}><section className="mobile-sheet" role="dialog" aria-modal="true" aria-label={sheetTitle} onClick={(event) => event.stopPropagation()}><div className="mobile-sheet__handle" aria-hidden="true" /><div className="mobile-sheet__header"><h2>{sheetTitle}</h2><button type="button" className="mobile-text-button" onClick={() => setMobileSheet(null)}>关闭</button></div><div className="mobile-sheet__items">
-      {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出</button><button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button><button type="button" onClick={() => { setMobileSheet(null); openRecycleBin(); }}>回收站</button></>}
+       {mobileSheet === "menu" && <>{<button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button>}<button type="button" onClick={() => { setMobileSheet(null); setExportSelectedItems([]); setExportExpandedChapterIds(new Set()); setExportOpen(true); }}>组合导出</button><button type="button" onClick={() => { setMobileSheet(null); createChapter(null); }}>新建一级章节</button><button type="button" onClick={() => { setMobileSheet(null); setShowFavorites(true); }}>查看收藏</button><button type="button" onClick={() => { setMobileSheet(null); openRecycleBin(); }}>回收站</button><button type="button" onClick={() => { setMobileSheet(null); openDataSecurity(); }}>数据与安全</button></>}
       {mobileSheet === "new" && selectedChapter && <><button type="button" onClick={() => { setMobileSheet(null); createChapter(selectedChapter.id); }}>新建子章节</button><button type="button" onClick={() => { setMobileSheet(null); createKnowledgePoint(selectedChapter.id); }}>新建知识点</button></>}
       {mobileSheet === "chapter" && selectedChapter && <><button type="button" disabled={exportBusy} onClick={() => { setMobileSheet(null); void exportChapter(); }}>导出本章 Word</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("chapter", selectedChapter.id); }}>{isPinned("chapter", selectedChapter.id) ? "取消置顶章节" : "置顶章节"}</button><button type="button" onClick={() => { setMobileSheet(null); renameChapter(selectedChapter); }}>重命名章节</button><button type="button" onClick={() => { setMobileSheet(null); setOrganizeMode(true); }}>整理目录</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteChapter(selectedChapter); }}>删除章节</button></>}
       {mobileSheet === "point" && selectedKnowledgePoint && <><button type="button" disabled={exportBusy} onClick={() => { setMobileSheet(null); void exportKnowledgePoint(); }}>导出 Word</button><button type="button" onClick={() => { setMobileSheet(null); toggleFavorite(); }}>{pointMeta?.favorite ? "取消收藏" : "加入收藏"}</button><button type="button" onClick={() => { setMobileSheet(null); togglePin("knowledge_point", selectedKnowledgePoint.id); }}>{isPinned("knowledge_point", selectedKnowledgePoint.id) ? "取消置顶知识点" : "置顶知识点"}</button><button type="button" onClick={() => { setMobileSheet(null); setShowReferencePicker(true); }}>添加到其他章节</button><button type="button" onClick={() => { setMobileSheet(null); beginPointEdit(); }}>编辑知识点</button><button type="button" onClick={() => { setMobileSheet(null); openHistory("shared"); }}>历史版本</button>{selectedPlacement && <button type="button" onClick={() => { setMobileSheet(null); openHistory("placement"); }}>本章补充历史</button>}<button type="button" onClick={() => { setMobileSheet(null); renameKnowledgePoint(selectedKnowledgePoint); }}>重命名知识点</button><button type="button" onClick={() => { setMobileSheet(null); removeCurrentPlacement(); }}>从当前章节移除</button><button type="button" className="mobile-sheet__danger" onClick={() => { setMobileSheet(null); deleteKnowledgePoint(selectedKnowledgePoint); }}>删除知识点</button></>}
@@ -1195,14 +1424,14 @@ function App() {
   };
 
   const pointPlacementsForMobile = (point: KnowledgePoint) => sortByOrder(tree.knowledge_point_placements.filter((placement) => placement.knowledge_point_id === point.id));
-  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main>;
+  const renderMobileShell = () => mobileSearchOpen ? <main className="mobile-shell"><section className="mobile-workbench">{renderMobileSearch()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main> : <main className="mobile-shell"><section className="mobile-workbench">{organizeMode ? renderMobileOrganize() : selectedKnowledgePoint ? renderMobileKnowledgePoint() : selectedChapter ? renderMobileChapter() : renderMobileHome()}{renderMobileSheet()}{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main>;
 
   if (isMobile) return renderMobileShell();
-  return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">悠扬讲义</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button></div></header>
+  return <main className="app-shell"><section className="workbench-card" aria-labelledby="page-title"><header className="page-header"><div><p className="eyebrow">PERSONAL ENGLISH HANDOUTS</p><h1 id="page-title">悠扬讲义</h1><p className="subtitle">整理、阅读与维护你的英语知识体系。</p></div><div className="header-actions"><button className={`organize-toggle ${organizeMode ? "organize-toggle--active" : ""}`} onClick={() => setOrganizeMode((current) => !current)}>{organizeMode ? "完成整理" : "整理目录"}</button><details className="more-menu page-more-menu"><summary aria-label="全局更多操作">···</summary><div className="more-menu__content"><button type="button" onClick={openDataSecurity}>数据与安全</button></div></details></div></header>
     <section className="search-panel" aria-label="全局搜索"><div className="search-row"><label className="search-box"><span aria-hidden="true">⌕</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="搜索标题、正文、例题、灵感或标签……" aria-label="全局搜索" /></label><select className="status-select" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value as "" | PointStatus)} aria-label="按状态筛选"><option value="">全部状态</option><option value="draft">草稿</option><option value="needs_improvement">待完善</option><option value="organized">已整理</option></select><select className="status-select" value={searchTagId} onChange={(event) => setSearchTagId(event.target.value)} aria-label="按标签筛选"><option value="">全部标签</option>{tags.map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</select></div>{searchQuery.trim() && <div className="search-results" aria-live="polite">{searchLoading ? <p className="empty-line">正在搜索……</p> : searchError ? <p className="search-error">{searchError}</p> : searchResults.length === 0 ? <p className="empty-line">没有找到匹配的知识点。</p> : <>{searchResults.map((result) => <button type="button" className="search-result" key={result.id} onClick={() => openSearchResult(result)}><span className="search-result__heading"><strong>{result.title}</strong><span className="status-pill">{pointStatusLabel(result.status)}</span></span><span className="search-result__meta">{result.match_types.map(matchTypeLabel).join(" · ")}{result.paths.length > 0 ? ` · ${result.paths.join(" ｜ ")}` : ""}</span>{result.context?.text && <span className="search-result__context">{result.context.text}</span>}{result.tags.length > 0 && <span className="search-result__tags">{result.tags.map((tag) => tag.name).join(" · ")}</span>}</button>)}</>}</div>}</section>
     {message && <div className={`message-bar ${saveState === "error" ? "message-bar--error" : ""}`} role="status">{message}</div>}
     <div className="workbench-layout"><aside className="tree-sidebar" aria-label="章节目录"><div className="tree-sidebar__header"><div><p className="content-kicker">目录</p><h2>讲义</h2></div><button className="icon-button" aria-label="新建一级章节" disabled={busy} onClick={() => createChapter(null)}>＋</button></div>{organizeMode && <p className="organize-tip">整理模式：可以拖动同级项目，或使用上下箭头调整顺序。</p>}<div className="tree-list">{loading ? <div className="tree-loading">正在读取目录……</div> : tree.chapters.length === 0 ? <div className="tree-empty">还没有章节。<button onClick={() => createChapter(null)}>新建一级章节</button></div> : childrenOf(null).map((chapter) => renderChapter(chapter))}</div></aside><section className="content-panel" aria-live="polite">{loading ? <div className="content-loading">正在读取云端目录……</div> : selectedKnowledgePoint ? renderKnowledgePointContent() : selectedChapter ? renderChapterContent() : renderHomeContent()}</section></div>
-    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}</section></main>;
+    <footer className="page-footer"><span><span className="connection-note__mark" aria-hidden="true" />正式数据源：Supabase PostgreSQL</span><span>悠扬讲义</span></footer>{renderHistoryDrawer()}{renderRecycleBin()}{renderExportDrawer()}{renderDataSecurity()}</section></main>;
 }
 
 function EmptyState({ onCreateRoot }: { onCreateRoot: () => void }) { return <div className="empty-state"><span className="empty-state__icon">✦</span><h2>这里还没有内容</h2><p>先创建一个一级章节，开始搭建你的英语讲义。</p><button className="primary-button" onClick={onCreateRoot}>＋ 新建一级章节</button></div>; }

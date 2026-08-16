@@ -152,10 +152,57 @@ type RecycleRestorePayload = {
   target_chapter_id?: unknown;
 };
 
+type BackupTableName =
+  | "stage1_notes"
+  | "workbench_initialization"
+  | "chapters"
+  | "knowledge_points"
+  | "knowledge_point_contents"
+  | "knowledge_point_placements"
+  | "tags"
+  | "knowledge_point_tags"
+  | "favorite_items"
+  | "pinned_items"
+  | "knowledge_point_versions"
+  | "placement_note_versions";
+
+type FullBackupData = Record<BackupTableName, Array<Record<string, unknown>>>;
+type FullBackup = {
+  manifest: {
+    app: "悠扬讲义";
+    backup_format_version: 1;
+    schema_version: "0008";
+    migration_versions: string[];
+    created_at: string;
+    data_checksum: string;
+    checksum_algorithm: "SHA-256";
+    counts: Record<BackupTableName, number>;
+  };
+  data: FullBackupData;
+};
+
 const MAX_TITLE_LENGTH = 200;
 const MAX_CONTENT_LENGTH = 200_000;
 const MAX_RICH_DOCUMENT_LENGTH = 500_000;
 const MAX_TAG_LENGTH = 80;
+const MAX_BACKUP_BYTES = 25_000_000;
+const BACKUP_FORMAT_VERSION = 1 as const;
+const BACKUP_SCHEMA_VERSION = "0008" as const;
+const BACKUP_MIGRATION_VERSIONS = ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"] as const;
+const BACKUP_TABLES: BackupTableName[] = [
+  "stage1_notes",
+  "workbench_initialization",
+  "chapters",
+  "knowledge_points",
+  "knowledge_point_contents",
+  "knowledge_point_placements",
+  "tags",
+  "knowledge_point_tags",
+  "favorite_items",
+  "pinned_items",
+  "knowledge_point_versions",
+  "placement_note_versions",
+];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUS_VALUES = new Set(["draft", "needs_improvement", "organized"]);
 const CONTENT_FIELDS = ["explanation", "exercises", "supplement", "inspiration"] as const;
@@ -252,6 +299,173 @@ async function hashJson(value: unknown) {
   const encoded = new TextEncoder().encode(JSON.stringify(value));
   const digest = await crypto.subtle.digest("SHA-256", encoded);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (value && typeof value === "object") {
+    return Object.keys(value as Record<string, unknown>).sort().reduce<Record<string, unknown>>((result, key) => {
+      result[key] = stableJsonValue((value as Record<string, unknown>)[key]);
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+function stableJsonStringify(value: unknown) {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+async function hashCanonicalJson(value: unknown) {
+  const encoded = new TextEncoder().encode(stableJsonStringify(value));
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function readAllRows<T extends Record<string, unknown>>(
+  client: SupabaseClient,
+  table: string,
+  columns: string,
+  orderColumns: string[],
+) {
+  const rows: T[] = [];
+  for (let offset = 0; ; offset += 1000) {
+    let query = client.from(table).select(columns);
+    for (const column of orderColumns) query = query.order(column, { ascending: true });
+    const { data, error } = await query.range(offset, offset + 999);
+    if (error) throw error;
+    const page = (data ?? []) as T[];
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  return rows;
+}
+
+async function buildFullBackupData(client: SupabaseClient): Promise<FullBackupData> {
+  const [stage1_notes, workbench_initialization, chapters, knowledge_points, knowledge_point_contents,
+    knowledge_point_placements, tags, knowledge_point_tags, favorite_items, pinned_items,
+    knowledge_point_versions, placement_note_versions] = await Promise.all([
+    readAllRows(client, "stage1_notes", "id,title,content,created_at,updated_at", ["id"]),
+    readAllRows(client, "workbench_initialization", "key,initialized_at", ["key"]),
+    readAllRows(client, "chapters", "id,title,parent_id,sort_order,content,created_at,updated_at,deleted_at,deletion_batch_id", ["id"]),
+    readAllRows(client, "knowledge_points", "id,title,status,created_at,updated_at,deleted_at,deletion_batch_id", ["id"]),
+    readAllRows(client, "knowledge_point_contents", "id,knowledge_point_id,explanation,exercises,supplement,inspiration,created_at,updated_at", ["id"]),
+    readAllRows(client, "knowledge_point_placements", "id,knowledge_point_id,chapter_id,sort_order,created_at,chapter_note,deleted_at,deletion_batch_id", ["id"]),
+    readAllRows(client, "tags", "id,name,created_at,updated_at", ["id"]),
+    readAllRows(client, "knowledge_point_tags", "knowledge_point_id,tag_id,created_at", ["knowledge_point_id", "tag_id"]),
+    readAllRows(client, "favorite_items", "knowledge_point_id,created_at", ["knowledge_point_id"]),
+    readAllRows(client, "pinned_items", "id,item_type,item_id,sort_order,created_at", ["id"]),
+    readAllRows(client, "knowledge_point_versions", "id,knowledge_point_id,snapshot,content_hash,version_source,created_at", ["id"]),
+    readAllRows(client, "placement_note_versions", "id,placement_id,chapter_note_snapshot,content_hash,version_source,created_at", ["id"]),
+  ]);
+  return {
+    stage1_notes,
+    workbench_initialization,
+    chapters,
+    knowledge_points,
+    knowledge_point_contents,
+    knowledge_point_placements,
+    tags,
+    knowledge_point_tags,
+    favorite_items,
+    pinned_items,
+    knowledge_point_versions,
+    placement_note_versions,
+  };
+}
+
+async function buildFullBackup(client: SupabaseClient): Promise<FullBackup> {
+  const data = await buildFullBackupData(client);
+  const counts = BACKUP_TABLES.reduce((result, table) => {
+    result[table] = data[table].length;
+    return result;
+  }, {} as Record<BackupTableName, number>);
+  return {
+    manifest: {
+      app: "悠扬讲义",
+      backup_format_version: BACKUP_FORMAT_VERSION,
+      schema_version: BACKUP_SCHEMA_VERSION,
+      migration_versions: [...BACKUP_MIGRATION_VERSIONS],
+      created_at: new Date().toISOString(),
+      data_checksum: await hashCanonicalJson(data),
+      checksum_algorithm: "SHA-256",
+      counts,
+    },
+    data,
+  };
+}
+
+function hasOnlyKeys(value: unknown, keys: string[]) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value as Record<string, unknown>).every((key) => keys.includes(key)));
+}
+
+async function validateFullBackup(value: unknown): Promise<FullBackup> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("BACKUP_INVALID");
+  const backup = value as Partial<FullBackup>;
+  const manifest = backup.manifest;
+  const data = backup.data;
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || !data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("BACKUP_INVALID");
+  }
+  const manifestRecord = manifest as Record<string, unknown>;
+  const expectedManifestKeys = ["app", "backup_format_version", "schema_version", "migration_versions", "created_at", "data_checksum", "checksum_algorithm", "counts"];
+  if (!hasOnlyKeys(manifest, expectedManifestKeys)
+    || manifestRecord.app !== "悠扬讲义"
+    || manifestRecord.backup_format_version !== BACKUP_FORMAT_VERSION
+    || manifestRecord.schema_version !== BACKUP_SCHEMA_VERSION
+    || manifestRecord.checksum_algorithm !== "SHA-256"
+    || !Array.isArray(manifestRecord.migration_versions)
+    || !manifestRecord.migration_versions.every((version) => typeof version === "string")
+    || typeof manifestRecord.created_at !== "string"
+    || typeof manifestRecord.data_checksum !== "string"
+    || !manifestRecord.counts || typeof manifestRecord.counts !== "object" || Array.isArray(manifestRecord.counts)) {
+    throw new Error(manifestRecord.schema_version && manifestRecord.schema_version !== BACKUP_SCHEMA_VERSION ? "BACKUP_SCHEMA_UNSUPPORTED" : "BACKUP_INVALID");
+  }
+  const dataRecord = data as Record<string, unknown>;
+  if (!hasOnlyKeys(data, BACKUP_TABLES)) throw new Error("BACKUP_INVALID");
+  const counts = manifestRecord.counts as Record<string, unknown>;
+  if (!hasOnlyKeys(counts, BACKUP_TABLES) || BACKUP_TABLES.some((table) => !Array.isArray(dataRecord[table]) || counts[table] !== (dataRecord[table] as unknown[]).length)) {
+    throw new Error("BACKUP_COUNTS_INVALID");
+  }
+  const size = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  if (size > MAX_BACKUP_BYTES) throw new Error("BACKUP_SIZE_LIMIT");
+  const checksum = await hashCanonicalJson(data);
+  if (checksum !== manifestRecord.data_checksum) throw new Error("BACKUP_CHECKSUM_INVALID");
+  return backup as FullBackup;
+}
+
+function backupIdSet(rows: Array<Record<string, unknown>>, key: string) {
+  return new Set(rows.map((row) => String(row[key])));
+}
+
+async function postRestoreVerify(client: SupabaseClient, backup: FullBackup) {
+  const current = await buildFullBackupData(client);
+  const projectByIds = (table: BackupTableName, key: string) => current[table].filter((row) => backupIdSet(backup.data[table], key).has(String(row[key])));
+  const projected: FullBackupData = {
+    ...current,
+    chapters: projectByIds("chapters", "id"),
+    knowledge_points: projectByIds("knowledge_points", "id"),
+    knowledge_point_placements: projectByIds("knowledge_point_placements", "id"),
+    knowledge_point_contents: current.knowledge_point_contents.filter((row) => backupIdSet(backup.data.knowledge_points, "id").has(String(row.knowledge_point_id))),
+    knowledge_point_versions: projectByIds("knowledge_point_versions", "id"),
+    placement_note_versions: projectByIds("placement_note_versions", "id"),
+  };
+  if (stableJsonStringify(projected) !== stableJsonStringify(backup.data)) throw new Error("BACKUP_POSTCHECK_FAILED");
+  return { passed: true, counts: backup.manifest.counts };
+}
+
+async function preflightFullBackup(client: SupabaseClient, backup: FullBackup) {
+  const { data, error } = await client.rpc("restore_workbench_backup", { p_backup: backup, p_apply: false });
+  if (error) throw error;
+  return data as Record<string, unknown>;
+}
+
+async function restoreFullBackup(client: SupabaseClient, backup: FullBackup) {
+  const { data, error } = await client.rpc("restore_workbench_backup", { p_backup: backup, p_apply: true });
+  if (error) throw error;
+  const postCheck = await postRestoreVerify(client, backup);
+  return { restore: data as Record<string, unknown>, post_check: postCheck };
 }
 
 async function readCurrentPointSnapshot(client: SupabaseClient, pointId: string, includeDeleted = false) {
@@ -600,6 +814,31 @@ function databaseError(request: Request, error: unknown, fallback: string) {
       ok: false,
       error: { code: "RECYCLE_ITEM_NOT_FOUND", message: "回收站项目不存在或已经恢复。" },
     });
+  }
+
+  const backupValidationCodes: Record<string, string> = {
+    BACKUP_INVALID: "这不是有效的悠扬讲义完整备份文件。",
+    BACKUP_COUNTS_INVALID: "备份文件数量统计与数据不一致。",
+    BACKUP_FIELDS_INVALID: "备份文件包含不支持的数据字段。",
+    BACKUP_DUPLICATE_ID: "备份文件存在重复数据 ID。",
+    BACKUP_PARENT_INVALID: "备份文件的章节层级关系无效。",
+    BACKUP_CHAPTER_CYCLE: "备份文件的章节结构存在循环。",
+    BACKUP_PLACEMENT_DUPLICATE: "备份文件存在重复的知识点位置关系。",
+    BACKUP_FOREIGN_KEY_INVALID: "备份文件存在失效的数据关系。",
+    BACKUP_ENUM_INVALID: "备份文件包含不支持的状态或类型。",
+    BACKUP_RICH_CONTENT_INVALID: "备份文件中的富文本结构无效。",
+    BACKUP_RELATION_DUPLICATE: "备份文件存在重复的标签、收藏或置顶关系。",
+    BACKUP_HISTORY_DUPLICATE: "备份文件存在重复的历史版本。",
+    BACKUP_CHECKSUM_INVALID: "备份文件完整性校验失败。",
+    BACKUP_SCHEMA_UNSUPPORTED: "该备份由更新版本的悠扬讲义生成，请先升级系统后再恢复。",
+    BACKUP_SIZE_LIMIT: "备份文件过大，无法安全处理。",
+    BACKUP_PIN_LIMIT: "备份文件中的置顶项目超过当前上限。",
+  };
+  for (const [code, messageText] of Object.entries(backupValidationCodes)) {
+    if (message.includes(code)) return json(request, 400, { ok: false, error: { code, message: messageText } });
+  }
+  if (message.includes("BACKUP_POSTCHECK_FAILED") || message.includes("BACKUP_RESTORE_TRANSACTION_FAILED")) {
+    return json(request, 500, { ok: false, error: { code: "BACKUP_RESTORE_TRANSACTION_FAILED", message: "恢复失败，数据库已保持恢复前状态。" } });
   }
 
   const validationCodes: Record<string, string> = {
@@ -1422,6 +1661,30 @@ async function handleNote(request: Request, client: SupabaseClient) {
 }
 
 async function handlePhase2(request: Request, client: SupabaseClient, resource: string) {
+  if (request.method === "GET" && resource === "backup") {
+    try {
+      return json(request, 200, { ok: true, backup: await buildFullBackup(client) });
+    } catch (error) {
+      return databaseError(request, error, "完整备份生成失败，请重试。");
+    }
+  }
+
+  if ((request.method === "POST" && (resource === "backup_preflight" || resource === "backup_restore"))) {
+    const contentLength = Number(request.headers.get("Content-Length") ?? "0");
+    if (contentLength > MAX_BACKUP_BYTES + 200_000) return databaseError(request, new Error("BACKUP_SIZE_LIMIT"), "备份文件过大，无法安全处理。");
+    const payload = await parseBody(request);
+    if (!payload || !("backup" in payload)) return databaseError(request, new Error("BACKUP_INVALID"), "这不是有效的悠扬讲义完整备份文件。");
+    try {
+      const backup = await validateFullBackup(payload.backup);
+      if (resource === "backup_preflight") {
+        return json(request, 200, { ok: true, preflight: await preflightFullBackup(client, backup) });
+      }
+      return json(request, 200, { ok: true, ...(await restoreFullBackup(client, backup)) });
+    } catch (error) {
+      return databaseError(request, error, resource === "backup_preflight" ? "备份预检失败，请检查文件后重试。" : "恢复失败，数据库已保持恢复前状态。");
+    }
+  }
+
   if (request.method === "GET" && resource === "history") {
     const url = new URL(request.url);
     const kind = url.searchParams.get("kind");
