@@ -231,15 +231,17 @@ function buildCleanupSql(selected) {
   const placementIds = sqlUuidArray(PLACEMENT_IDS);
   const pointVersionIds = sqlUuidArray(KNOWLEDGE_POINT_VERSION_IDS);
   const noteVersionIds = sqlUuidArray(PLACEMENT_NOTE_VERSION_IDS);
-  return `BEGIN;
+  // Supabase CLI's Management API rejects explicit top-level BEGIN/COMMIT by
+  // switching to a direct database login. A single DO block is still atomic:
+  // any RAISE EXCEPTION rolls back every statement in this block.
+  return `DO $cleanup$
+BEGIN
 CREATE TEMP TABLE _cleanup_expected_chapters(id uuid primary key, title text, created_at timestamptz, updated_at timestamptz, deleted_at timestamptz) ON COMMIT DROP;
 INSERT INTO _cleanup_expected_chapters VALUES
 ${expectedChapters};
 CREATE TEMP TABLE _cleanup_expected_points(id uuid primary key, title text, created_at timestamptz, updated_at timestamptz, deleted_at timestamptz) ON COMMIT DROP;
 INSERT INTO _cleanup_expected_points VALUES
 ${expectedPoints};
-DO $$
-BEGIN
   IF (SELECT count(*) FROM public.chapters WHERE id = ANY(${chapterIds})) <> ${CHAPTER_IDS.length} THEN RAISE EXCEPTION 'CLEANUP_STATE_CHANGED_CHAPTER_COUNT'; END IF;
   IF (SELECT count(*) FROM public.knowledge_points WHERE id = ANY(${pointIds})) <> ${KNOWLEDGE_POINT_IDS.length} THEN RAISE EXCEPTION 'CLEANUP_STATE_CHANGED_POINT_COUNT'; END IF;
   IF EXISTS (SELECT 1 FROM public.chapters c JOIN _cleanup_expected_chapters e USING (id) WHERE c.title IS DISTINCT FROM e.title OR c.created_at IS DISTINCT FROM e.created_at OR c.updated_at IS DISTINCT FROM e.updated_at OR c.deleted_at IS DISTINCT FROM e.deleted_at OR c.deleted_at IS NULL) THEN RAISE EXCEPTION 'CLEANUP_STATE_CHANGED_CHAPTER'; END IF;
@@ -252,14 +254,14 @@ BEGIN
   IF EXISTS (SELECT 1 FROM public.favorite_items WHERE knowledge_point_id = ANY(${pointIds})) THEN RAISE EXCEPTION 'CLEANUP_UNAUDITED_FAVORITE_RELATION'; END IF;
   IF EXISTS (SELECT 1 FROM public.pinned_items WHERE item_id = ANY(${pointIds}) OR item_id = ANY(${chapterIds})) THEN RAISE EXCEPTION 'CLEANUP_UNAUDITED_PIN_RELATION'; END IF;
   IF EXISTS (SELECT 1 FROM public.chapters WHERE parent_id = ANY(${chapterIds}) AND id <> ALL(${chapterIds})) THEN RAISE EXCEPTION 'CLEANUP_UNALLOWLISTED_CHILD_CHAPTER'; END IF;
-END $$;
 DELETE FROM public.placement_note_versions WHERE id = ANY(${noteVersionIds});
 DELETE FROM public.knowledge_point_versions WHERE id = ANY(${pointVersionIds});
 DELETE FROM public.knowledge_point_contents WHERE id = ANY(${contentIds});
 DELETE FROM public.knowledge_point_placements WHERE id = ANY(${placementIds});
 DELETE FROM public.knowledge_points WHERE id = ANY(${pointIds});
 DELETE FROM public.chapters WHERE id = ANY(${chapterIds});
-COMMIT;`;
+END
+$cleanup$;`;
 }
 
 function verifyProjectIdentity() {
